@@ -61,6 +61,18 @@ async fn app() -> anyhow::Result<()> {
     // Run after db connection.
     startup::on_startup().await;
 
+    // Validate configuration and warm the Infisical secret cache, so a
+    // misconfigured provider is reported at boot rather than surfacing hours
+    // later as a confusing deploy failure.
+    //
+    // Deliberately non-fatal. Core and Infisical run on the same host, so
+    // crashing here would create a boot-order dependency between them and a
+    // crash loop whenever both restart together. Deploys that reference an
+    // `infisical://` token still fail closed via the guard in `interpolate`.
+    if let Err(e) = infisical::preload().await {
+      error!("Infisical secret provider failed to initialize: {e:#}");
+    }
+
     // Spawn background tasks
     monitor::spawn_monitoring_loops();
     resource::spawn_resource_refresh_loop();
