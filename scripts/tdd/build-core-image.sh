@@ -58,7 +58,7 @@ else
 fi
 
 docker build \
-  --file bin/tdd/core-only.Dockerfile \
+  --file scripts/tdd/core-only.Dockerfile \
   --build-arg "KOMODO_VERSION=${KOMODO_VERSION}" \
   --label "org.opencontainers.image.revision=${GIT_SHA}" \
   --label "org.opencontainers.image.version=${TAG}" \
