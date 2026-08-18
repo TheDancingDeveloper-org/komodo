@@ -3221,6 +3221,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "infisical"
+version = "2.2.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3506,6 +3519,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "indexmap 2.14.0",
+ "infisical",
  "interpolate",
  "komodo_client",
  "mogh_auth_client",

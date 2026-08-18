@@ -22,6 +22,7 @@ komodo_client = { path = "client/core/rs" }
 periphery_client = { path = "client/periphery/rs" }
 environment = { path = "lib/environment" }
 interpolate = { path = "lib/interpolate" }
+infisical = { path = "lib/infisical" }
 formatting = { path = "lib/formatting" }
 transport = { path = "lib/transport" }
 database = { path = "lib/database" }
