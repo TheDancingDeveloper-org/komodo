@@ -6,6 +6,77 @@ use komodo_client::entities::{
   stack::Stack, update::Log,
 };
 
+/// Prefix identifying an Infisical interpolation token
+/// (`[[infisical://<project-alias>/<environment>/<SECRET_KEY>]]`).
+///
+/// Kept in sync by hand with `infisical::TOKEN_PREFIX`. The duplication is
+/// deliberate — this crate is compiled into Periphery as well as Core, and
+/// depending on the `infisical` crate would drag `reqwest` and `tokio` into
+/// the Periphery binary for the sake of one string constant.
+pub const INFISICAL_TOKEN_PREFIX: &str = "infisical://";
+
+/// Find a live Infisical reference that the secrets map cannot resolve.
+///
+/// Scans the *input* to the secret-interpolation pass rather than its output,
+/// because the two are ambiguous: `svi` renders both an escaped literal
+/// (`[[[infisical://x]]]`) and an unresolved reference (`[[infisical://x]]`)
+/// as the same `[[infisical://x]]` text. Only the input distinguishes them.
+///
+/// The `[[` splitting and the leading-`[` escape rule below deliberately
+/// mirror `svi::interpolate_variables`; the unit tests pin that correspondence.
+fn unresolved_provider_token(
+  input: &str,
+  secrets: &HashMap<String, String>,
+) -> Option<String> {
+  let mut split = input.split("[[");
+  // Text before the first opener cannot contain a reference.
+  split.next();
+  for val in split {
+    // svi's escape: '[[[x]]]' is the literal '[[x]]', not a reference.
+    if val.starts_with('[') {
+      continue;
+    }
+    // No closing tag - svi raises its own NoClosingTags error for this.
+    let Some((token, _)) = val.split_once("]]") else {
+      continue;
+    };
+    if token.starts_with(INFISICAL_TOKEN_PREFIX)
+      && !secrets.contains_key(token)
+    {
+      return Some(token.to_string());
+    }
+  }
+  None
+}
+
+/// Fail closed on an unresolvable external-provider reference.
+///
+/// `svi` is called with `fail_on_missing_variable = false`, which leaves an
+/// unknown `[[TOKEN]]` in the output *verbatim*. For an ordinary Komodo
+/// variable that is a deliberate, harmless passthrough. For a secret-manager
+/// reference it is dangerous: without this check a failed lookup would deploy
+/// the literal string `[[infisical://apps/prod/DB_PASSWORD]]` as the password,
+/// and the deployment would report success.
+///
+/// Checking here keeps the blast radius tight. Only resources that actually
+/// reference a provider token fail; everything else deploys normally even
+/// while the provider is unreachable.
+fn ensure_provider_tokens_resolvable(
+  input: &str,
+  secrets: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+  match unresolved_provider_token(input, secrets) {
+    None => Ok(()),
+    Some(token) => anyhow::bail!(
+      "unresolved secret reference '{token}'. The Infisical secret provider \
+       did not supply this key, so it would have been left uninterpolated. \
+       Refusing to deploy a literal token in place of a secret value. Check \
+       that the provider is enabled and healthy, and that the project alias, \
+       environment and key in the reference all exist."
+    ),
+  }
+}
+
 pub struct Interpolator<'a> {
   variables: Option<&'a HashMap<String, String>>,
   secrets: &'a HashMap<String, String>,
@@ -115,6 +186,10 @@ impl<'a> Interpolator<'a> {
       target.to_string()
     };
 
+    // Refuse to proceed if a provider reference cannot be resolved, rather
+    // than letting svi pass the raw token through into a deployment.
+    ensure_provider_tokens_resolvable(&res, self.secrets)?;
+
     // second pass - secrets
     let (res, more_replacers) = svi::interpolate_variables(
       &res,
@@ -178,5 +253,115 @@ impl<'a> Interpolator<'a> {
           .join("\n"),)
       );
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn interpolate(
+    target: &str,
+    secrets: &[(&str, &str)],
+  ) -> anyhow::Result<String> {
+    let secrets: HashMap<String, String> = secrets
+      .iter()
+      .map(|(k, v)| (k.to_string(), v.to_string()))
+      .collect();
+    let mut interpolator = Interpolator::new(None, &secrets);
+    let mut target = target.to_string();
+    interpolator.interpolate_string(&mut target)?;
+    Ok(target)
+  }
+
+  #[test]
+  fn resolves_an_infisical_token() {
+    let out = interpolate(
+      "DB_PASSWORD=[[infisical://apps/prod/DB_PASSWORD]]",
+      &[("infisical://apps/prod/DB_PASSWORD", "hunter2")],
+    )
+    .expect("should resolve");
+    assert_eq!(out, "DB_PASSWORD=hunter2");
+  }
+
+  #[test]
+  fn refuses_to_pass_through_an_unresolved_infisical_token() {
+    // The whole point of the guard: without it, svi leaves the token verbatim
+    // and Komodo would deploy the literal string as the password.
+    let err = interpolate(
+      "DB_PASSWORD=[[infisical://apps/prod/MISSING]]",
+      &[],
+    )
+    .expect_err("must not silently pass through");
+    let msg = format!("{err:#}");
+    assert!(
+      msg.contains("infisical://apps/prod/MISSING"),
+      "error should name the offending reference, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn unresolved_ordinary_variable_still_passes_through() {
+    // Upstream behaviour must be preserved for non-provider tokens, or this
+    // fork would break existing Komodo deployments.
+    let out = interpolate("FOO=[[NOT_A_PROVIDER_TOKEN]]", &[])
+      .expect("upstream passthrough should be preserved");
+    assert_eq!(out, "FOO=[[NOT_A_PROVIDER_TOKEN]]");
+  }
+
+  #[test]
+  fn escaped_token_is_not_treated_as_a_reference() {
+    // '[[[x]]]' is svi's escape and yields the literal '[[x]]'. That output
+    // contains the prefix but was never a live reference, so the guard must
+    // not fire on it.
+    let out =
+      interpolate("LITERAL=[[[infisical://apps/prod/KEY]]]", &[])
+        .expect("escaped token should be allowed");
+    assert_eq!(out, "LITERAL=[[infisical://apps/prod/KEY]]");
+  }
+
+  #[test]
+  fn resolves_several_references_in_one_string() {
+    let out = interpolate(
+      "A=[[infisical://apps/prod/A]] B=[[infisical://cicd/prod/B]] C=plain",
+      &[
+        ("infisical://apps/prod/A", "one"),
+        ("infisical://cicd/prod/B", "two"),
+      ],
+    )
+    .expect("should resolve both");
+    assert_eq!(out, "A=one B=two C=plain");
+  }
+
+  #[test]
+  fn one_missing_reference_fails_even_when_others_resolve() {
+    let err = interpolate(
+      "A=[[infisical://apps/prod/A]] B=[[infisical://apps/prod/MISSING]]",
+      &[("infisical://apps/prod/A", "one")],
+    )
+    .expect_err("a single missing reference must fail the whole target");
+    assert!(format!("{err:#}").contains("apps/prod/MISSING"));
+  }
+
+  #[test]
+  fn escape_does_not_survive_the_variables_pass() {
+    // Documents a pre-existing svi/Komodo quirk rather than new behaviour:
+    // when a variables map is present, interpolation runs twice, and the
+    // first pass already consumes the '[[[x]]]' escape into '[[x]]'. The
+    // second pass therefore sees a live reference. Escaping a literal
+    // provider token is only reliable on resources with no variables pass.
+    // Failing closed is the safe direction for that ambiguity.
+    let variables = HashMap::new();
+    let secrets = HashMap::new();
+    let mut interpolator =
+      Interpolator::new(Some(&variables), &secrets);
+    let mut target = "L=[[[infisical://apps/prod/KEY]]]".to_string();
+    assert!(interpolator.interpolate_string(&mut target).is_err());
+  }
+
+  #[test]
+  fn untouched_input_without_tokens_is_unchanged() {
+    let out = interpolate("PLAIN=value", &[]).expect("should pass");
+    assert_eq!(out, "PLAIN=value");
   }
 }
