@@ -443,6 +443,17 @@ pub async fn get_variables_and_secrets()
     .map(|variable| (variable.name, variable.value))
     .collect();
 
+  // Extend with externally managed secrets, resolved live from Infisical and
+  // addressed as `[[infisical://<alias>/<environment>/<KEY>]]`. Added last so
+  // an operator can always shadow a provider value with a Core secret or a
+  // secret Variable of the same name during an incident.
+  //
+  // This never fails: `get_variables_and_secrets` also feeds every alerter, so
+  // a provider outage must not suppress the alerts reporting it. Resources
+  // that genuinely reference a provider token are failed instead by the guard
+  // in `interpolate`.
+  infisical::extend_secrets(&mut secrets).await;
+
   Ok(VariablesAndSecrets { variables, secrets })
 }
 
