@@ -2876,6 +2876,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "infisical"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
