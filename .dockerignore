@@ -1,0 +1,10 @@
+# Keep the build context small. The Docker daemon used to build this fork is
+# Node B's own, and its root disk is the estate's tightest resource.
+#
+# Conservative on purpose: `ui/` itself is NOT excluded, because upstream's
+# bin/core/single-arch.Dockerfile builds the UI from source and needs it.
+.git/
+target/
+**/node_modules/
+docsite/
+screenshots/
