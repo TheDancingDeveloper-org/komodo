@@ -47,7 +47,7 @@ jobs:
           git config user.email "sprooty@sprooty.com"
           git remote add upstream https://github.com/moghtech/komodo.git 2>/dev/null || true
           git fetch --tags --quiet upstream
-          git branch -f tdd/patches origin/tdd/patches
+          git fetch --quiet origin tdd/patches
 
           if [ -n "${{ inputs.tag }}" ]; then
             target="${{ inputs.tag }}"
@@ -62,7 +62,7 @@ jobs:
           # The tag the series currently sits on. The series is short, so its
           # base is the newest tag that is an ancestor of its root commit.
           base="$(git describe --tags --abbrev=0 --exclude='*-dev-*' \
-                  "$(git rev-list tdd/patches --not --tags='v[0-9]*' | tail -1)^" 2>/dev/null || true)"
+                  "$(git rev-list origin/tdd/patches --not --tags='v[0-9]*' | tail -1)^" 2>/dev/null || true)"
 
           echo "base=$base"     >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
@@ -80,7 +80,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          git checkout -q -B "tdd/rebase/${{ steps.check.outputs.target }}" tdd/patches
+          git checkout -q -B "tdd/rebase/${{ steps.check.outputs.target }}" origin/tdd/patches
           git rebase --onto "${{ steps.check.outputs.target }}" "${{ steps.check.outputs.base }}"
 
       - name: Capture the conflict, if it did not apply cleanly
