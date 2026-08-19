@@ -29,7 +29,9 @@ env:
 
 jobs:
   test:
-    runs-on: [self-hosted, node-b, linux, x64, rust]
+    # Pure Rust, no node-b dependency -- so it may use any rust runner in the
+    # pool rather than contending with the publish jobs for node-b.
+    runs-on: [self-hosted, linux, x64, rust]
     steps:
       - uses: actions/checkout@v7
 
