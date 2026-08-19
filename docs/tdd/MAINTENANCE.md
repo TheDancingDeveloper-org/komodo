@@ -36,6 +36,7 @@ These are not style preferences — they are the reason the series applied to v2
 3. **Never touch the config structs.** Provider configuration is read from the process environment rather than `CoreConfig`. This deliberately avoids `client/core/rs/src/entities/config/core.rs`, `bin/core/src/config.rs` and `config/core.config.toml`, the three highest-churn config files upstream. Resisting the "but it belongs in CoreConfig" instinct is what keeps this fork maintainable.
 4. **One hook, not many.** The integration attaches at a single function (`get_variables_and_secrets`) that already backs all 12 interpolation call sites.
 5. **Don't inherit optional workspace metadata.** Upstream removed `workspace.package.authors` in v2.3.2, which broke the crate manifest on the first rebase. Inherit only fields upstream is certain to keep.
+6. **Keep our `Cargo.toml` additions in the trailing `# FORK` block.** Upstream bumps dependency versions throughout those lists on nearly every release, so any line of ours sitting next to a bumped line conflicts every single time. This was learned the hard way — `aws-lc-rs` and `zeroize` were originally added beside `rustls` and conflicted on the very next rebase.
 
 ## Routine upgrade
 
@@ -69,7 +70,7 @@ A conflict means upstream changed something the patch series touches. There are 
 | `bin/core/src/helpers/query.rs` | `get_variables_and_secrets` was refactored | Re-attach `infisical::extend_secrets(&mut secrets).await` after the secret Variables are merged, keeping it last |
 | `bin/core/src/main.rs` | startup sequence reordered | Re-place the `preload()` call after `startup::on_startup()` |
 | `lib/interpolate/src/lib.rs` | interpolation rewritten | Re-attach the guard immediately **before** the secrets pass; re-check `svi`'s escape rule still matches `unresolved_provider_token` |
-| `Cargo.toml` / `bin/core/Cargo.toml` | dependency list reshuffled | Trivial; re-add the one line |
+| `Cargo.toml` / `bin/core/Cargo.toml` | upstream bumped a dependency version next to ours | Keep **upstream's** versions, re-add our lines. If ours were not already in the trailing `# FORK` block, move them there so it stops recurring |
 
 After resolving, **always** re-run `cargo test -p interpolate`. The escape-handling tests are the ones that catch a silently broken guard, which is the dangerous failure mode: a broken guard does not error, it lets a literal token through into a deployment.
 
@@ -77,7 +78,8 @@ After resolving, **always** re-run `cargo test -p interpolate`. The escape-handl
 
 | Date | From | To | Result |
 |---|---|---|---|
-| 2026-08-18 | `v2.2.0` | `v2.3.2` | Zero conflicts. One fix needed: upstream removed `workspace.package.authors`, so the crate manifest stopped inheriting it. Builds and passes all 10 tests on both tags. |
+| 2026-08-18 | `v2.2.0` | `v2.3.2` | Zero conflicts. One fix needed: upstream removed `workspace.package.authors`, so the crate manifest stopped inheriting it. |
+| 2026-08-19 | `v2.2.0` | `v2.3.2` | One conflict, in `Cargo.toml`: our `aws-lc-rs`/`zeroize` lines sat beside `rustls`, `uuid` and `data-encoding`, all of which upstream bumped. Resolved by keeping upstream's versions and re-adding ours — then fixed properly by moving both into the trailing `# FORK` block so it cannot recur. Builds and passes all 30 tests on both tags. |
 
 ## Contributing upstream
 
