@@ -17,9 +17,13 @@ on:
         type: string
         required: false
 
+# No `pull-requests: write`. The organization disallows GitHub Actions creating
+# or approving pull requests, across every repo. That is a deliberate security
+# control and not something this workflow should have loosened, so a clean
+# rebase is reported as an issue with the branch pushed and ready, and a human
+# opens the PR if they want one.
 permissions:
   contents: write
-  pull-requests: write
   issues: write
 
 concurrency:
@@ -124,17 +128,20 @@ jobs:
           cargo test -p infisical -p interpolate
           cargo check -p komodo_core -p komodo_periphery
 
-      - name: Publish the rebased branch and open a PR
+      - name: Publish the rebased branch and report it is ready
         if: steps.check.outputs.uptodate == 'false' && steps.rebase.outcome == 'success' && steps.verify.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           API: ${{ github.api_url }}
+          SERVER: ${{ github.server_url }}
           TARGET: ${{ steps.check.outputs.target }}
           BASE: ${{ steps.check.outputs.base }}
         run: |
           set -euo pipefail
           git push --force-with-lease origin "tdd/rebase/$TARGET"
+
+          title="Parity: upstream $TARGET applies cleanly - ready to promote"
 
           # The runner image has no `gh`, so this talks to the REST API directly
           # and uses `jq` to build and read JSON rather than hand-escaping it.
@@ -142,17 +149,17 @@ jobs:
           # Each result is assigned to a variable BEFORE being tested. Inside an
           # `if` condition `set -e` does not apply, so a failing command
           # substitution there would silently evaluate as empty -- which is
-          # exactly how an earlier version reported "PR already open" and exited
-          # 0 after its JSON tool turned out to be missing.
-          existing="$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$API/repos/$REPO/pulls?state=open&head=${REPO%%/*}:tdd/rebase/$TARGET")"
-          open_count="$(jq -r 'length' <<< "$existing")"
-          case "$open_count" in
-            ''|*[!0-9]*) echo "::error::could not read the open PR count"; exit 1 ;;
+          # exactly how an earlier version reported "already open" and exited 0
+          # after its JSON tool turned out to be missing.
+          query="$(jq -rn --arg q "repo:$REPO is:issue is:open in:title $title" '$q|@uri')"
+          found="$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API/search/issues?q=$query")"
+          total="$(jq -r '.total_count' <<< "$found")"
+          case "$total" in
+            ''|*[!0-9]*) echo "::error::could not read the open issue count"; exit 1 ;;
           esac
-          if [ "$open_count" != "0" ]; then
-            echo "PR already open for tdd/rebase/$TARGET"
+          if [ "$total" != "0" ]; then
+            echo "Already reported for $TARGET"
             exit 0
           fi
 
@@ -166,6 +173,9 @@ jobs:
             echo
             echo "The lockfile was refreshed for this release and committed onto the branch."
             echo
+            echo "Branch: [\`tdd/rebase/$TARGET\`]($SERVER/$REPO/tree/tdd/rebase/$TARGET)"
+            echo "Compare: $SERVER/$REPO/compare/tdd/patches...tdd/rebase/$TARGET"
+            echo
             echo "**A clean rebase is not a deployment.** Before promoting, follow"
             echo "\`docs/tdd/MAINTENANCE.md\`, then build the image and re-run the canary checks in"
             echo "\`docs/tdd/CANARY-2026-08-19.md\` -- both defects found so far were invisible to"
@@ -176,22 +186,20 @@ jobs:
             echo '```'
             echo "git branch -f tdd/patches         tdd/rebase/$TARGET"
             echo "git branch -f tdd/release/$TARGET tdd/rebase/$TARGET"
+            echo "git push origin tdd/patches tdd/release/$TARGET"
             echo '```'
             echo
-            echo "Opened by the Upstream parity workflow."
-          } > /tmp/parity-pr-body.md
+            echo "Reported by the Upstream parity workflow. It does not open the PR itself:"
+            echo "the organization disallows GitHub Actions creating pull requests, which is a"
+            echo "deliberate control this workflow should not work around."
+          } > /tmp/parity-body.md
 
-          payload="$(jq -n \
-            --arg title "Rebase onto upstream $TARGET" \
-            --arg head  "tdd/rebase/$TARGET" \
-            --arg base  "tdd/patches" \
-            --rawfile body /tmp/parity-pr-body.md \
-            '{title: $title, head: $head, base: $base, body: $body}')"
-
+          payload="$(jq -n --arg title "$title" --rawfile body /tmp/parity-body.md \
+            '{title: $title, body: $body}')"
           curl -sS -f -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API/repos/$REPO/pulls" -d "$payload" > /dev/null
-          echo "Opened PR for tdd/rebase/$TARGET"
+            "$API/repos/$REPO/issues" -d "$payload" > /dev/null
+          echo "Reported: $title"
 
       - name: Report a conflict or a failed verification
         if: steps.check.outputs.uptodate == 'false' && (steps.rebase.outcome == 'failure' || steps.lockfile.outcome == 'failure' || steps.verify.outcome == 'failure')
