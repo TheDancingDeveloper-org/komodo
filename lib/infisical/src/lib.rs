@@ -45,13 +45,13 @@
 use std::{
   collections::HashMap,
   sync::{Arc, OnceLock},
-  time::Instant,
 };
 
 use tokio::sync::{Mutex, RwLock};
 
 mod client;
 mod config;
+mod persist;
 
 pub use config::{InfisicalConfig, Scope, enabled};
 
@@ -76,7 +76,9 @@ pub fn token_for(
 
 struct Snapshot {
   secrets: Arc<HashMap<String, String>>,
-  fetched_at: Instant,
+  /// Wall-clock, not a monotonic `Instant`, because a snapshot restored from
+  /// disk has to carry an age across a process restart.
+  fetched_at_unix: u64,
 }
 
 struct ProviderState {
@@ -88,6 +90,16 @@ struct ProviderState {
 }
 
 impl ProviderState {
+  fn scope_names(&self) -> Vec<String> {
+    self
+      .client
+      .config()
+      .scopes
+      .iter()
+      .map(|scope| format!("{}/{}", scope.alias, scope.environment))
+      .collect()
+  }
+
   async fn fresh_snapshot(
     &self,
   ) -> Option<Arc<HashMap<String, String>>> {
@@ -95,7 +107,8 @@ impl ProviderState {
     guard
       .as_ref()
       .filter(|snapshot| {
-        snapshot.fetched_at.elapsed() < self.client.config().cache_ttl
+        persist::age_seconds(snapshot.fetched_at_unix)
+          < self.client.config().cache_ttl.as_secs()
       })
       .map(|snapshot| snapshot.secrets.clone())
   }
@@ -105,24 +118,130 @@ impl ProviderState {
   ) -> anyhow::Result<Arc<HashMap<String, String>>> {
     let mut merged: HashMap<String, String> = HashMap::new();
     for scope in &self.client.config().scopes {
-      let scope_secrets = self.client.fetch_scope(scope).await?;
-      merged.extend(scope_secrets);
+      merged.extend(self.client.fetch_scope(scope).await?);
     }
+
     let secrets = Arc::new(merged);
-    let mut guard = self.cache.write().await;
-    *guard = Some(Snapshot {
-      secrets: secrets.clone(),
-      fetched_at: Instant::now(),
-    });
+    let fetched_at_unix = persist::now_unix();
+
+    {
+      let mut guard = self.cache.write().await;
+      *guard = Some(Snapshot {
+        secrets: secrets.clone(),
+        fetched_at_unix,
+      });
+    }
+
+    // Persist the new last-known-good set. Best effort: a failure to write the
+    // cache must not fail a refresh that otherwise succeeded, because the
+    // in-memory copy is already good and deploys can proceed on it.
+    if let Some(path) = &self.client.config().cache_file {
+      let snapshot =
+        persist::snapshot_from(&secrets, self.scope_names());
+      if let Err(error) = persist::save(path, &snapshot) {
+        tracing::error!(
+          path = %path.display(),
+          "Failed to persist the Infisical snapshot; Core will not be able to \
+           cold-start with these values if Infisical is unreachable: {error:#}"
+        );
+      }
+    }
+
     Ok(secrets)
+  }
+
+  /// Restore the last-known-good snapshot from disk when nothing is cached in
+  /// memory yet -- the cold-start case this whole module exists for.
+  async fn seed_from_disk(&self) {
+    let Some(path) = &self.client.config().cache_file else {
+      return;
+    };
+    if self.cache.read().await.is_some() {
+      return;
+    }
+
+    match persist::load(path) {
+      Ok(None) => {
+        tracing::warn!(
+          path = %path.display(),
+          "No persisted Infisical snapshot to fall back on"
+        );
+      }
+      Ok(Some(stored)) => {
+        let age = persist::age_seconds(stored.fetched_at_unix);
+        tracing::warn!(
+          path = %path.display(),
+          count = stored.secrets.len(),
+          age_seconds = age,
+          scopes = %stored.scopes.join(", "),
+          "Restored the last-known-good Infisical snapshot from disk"
+        );
+        let mut guard = self.cache.write().await;
+        *guard = Some(Snapshot {
+          secrets: Arc::new(stored.secrets),
+          fetched_at_unix: stored.fetched_at_unix,
+        });
+      }
+      Err(error) => {
+        tracing::error!(
+          path = %path.display(),
+          "Could not read the persisted Infisical snapshot: {error:#}"
+        );
+      }
+    }
+  }
+
+  /// Decide what to serve when a refresh has failed.
+  async fn serve_stale(
+    &self,
+    error: anyhow::Error,
+  ) -> anyhow::Result<Arc<HashMap<String, String>>> {
+    self.seed_from_disk().await;
+
+    let guard = self.cache.read().await;
+    let Some(snapshot) = guard.as_ref() else {
+      return Err(error.context(
+        "no cached or persisted Infisical secrets are available to fall back on",
+      ));
+    };
+
+    let age = persist::age_seconds(snapshot.fetched_at_unix);
+    let config = self.client.config();
+
+    if let Some(max) = config.stale_max {
+      if age > max.as_secs() {
+        return Err(error.context(format!(
+          "the last known Infisical secrets are {age}s old, beyond the configured \
+           limit of {}s",
+          max.as_secs()
+        )));
+      }
+    }
+
+    // Escalate the log level with age. A brief outage is a warning; a long one
+    // means deploys have been running on values nobody has revalidated, which
+    // deserves to look like a problem.
+    if age >= config.stale_warn.as_secs() {
+      tracing::error!(
+        age_seconds = age,
+        "Infisical has been unreachable for a long time; still deploying with \
+         the last known good secrets, which may now be out of date: {error:#}"
+      );
+    } else {
+      tracing::warn!(
+        age_seconds = age,
+        "Infisical refresh failed; serving the last known good secrets: {error:#}"
+      );
+    }
+
+    Ok(snapshot.secrets.clone())
   }
 
   /// Return the current secret map, refreshing if the cache has aged out.
   ///
-  /// If a refresh fails but a previous snapshot is still within
-  /// `stale_max`, that snapshot is served with a warning. Serving a slightly
-  /// stale secret beats failing every deploy in the estate the moment
-  /// Infisical restarts — and the window is bounded and configurable.
+  /// Falls back to the last known good values -- in memory, or restored from
+  /// disk after a restart -- rather than failing, so an Infisical outage does
+  /// not stop the estate from deploying. See `InfisicalConfig::stale_max`.
   async fn snapshot(
     &self,
   ) -> anyhow::Result<Arc<HashMap<String, String>>> {
@@ -139,22 +258,7 @@ impl ProviderState {
 
     match self.refresh().await {
       Ok(secrets) => Ok(secrets),
-      Err(error) => {
-        let guard = self.cache.read().await;
-        match guard.as_ref() {
-          Some(snapshot)
-            if snapshot.fetched_at.elapsed()
-              < self.client.config().stale_max =>
-          {
-            tracing::warn!(
-              age_seconds = snapshot.fetched_at.elapsed().as_secs(),
-              "Infisical refresh failed; serving cached secrets: {error:#}"
-            );
-            Ok(snapshot.secrets.clone())
-          }
-          _ => Err(error),
-        }
-      }
+      Err(error) => self.serve_stale(error).await,
     }
   }
 }
@@ -200,10 +304,32 @@ pub async fn preload() -> anyhow::Result<()> {
   }
   let state = state().map_err(|e| anyhow::anyhow!("{e}"))?;
   let secrets = state.snapshot().await?;
-  tracing::info!(
-    count = secrets.len(),
-    "Loaded secrets from Infisical"
-  );
+
+  // Report whether these values came from Infisical just now or from the
+  // persisted fallback, so a cold start during an outage is obvious in the log
+  // rather than looking like a normal healthy boot.
+  let age = {
+    let guard = state.cache.read().await;
+    guard
+      .as_ref()
+      .map(|s| persist::age_seconds(s.fetched_at_unix))
+  };
+  match age {
+    Some(age) if age > state.client.config().cache_ttl.as_secs() => {
+      tracing::warn!(
+        count = secrets.len(),
+        age_seconds = age,
+        "Started with the last known good Infisical secrets; a live refresh did \
+         not succeed"
+      );
+    }
+    _ => {
+      tracing::info!(
+        count = secrets.len(),
+        "Loaded secrets from Infisical"
+      );
+    }
+  }
   Ok(())
 }
 
