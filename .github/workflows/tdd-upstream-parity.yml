@@ -136,13 +136,22 @@ jobs:
           set -euo pipefail
           git push --force-with-lease origin "tdd/rebase/$TARGET"
 
-          # The runner image has no `gh`, so this talks to the REST API
-          # directly. `node` is always present on an Actions runner, and is
-          # used only to build and read JSON safely.
-          existing="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+          # The runner image has no `gh`, so this talks to the REST API directly
+          # and uses `jq` to build and read JSON rather than hand-escaping it.
+          #
+          # Each result is assigned to a variable BEFORE being tested. Inside an
+          # `if` condition `set -e` does not apply, so a failing command
+          # substitution there would silently evaluate as empty -- which is
+          # exactly how an earlier version reported "PR already open" and exited
+          # 0 after its JSON tool turned out to be missing.
+          existing="$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$API/repos/$REPO/pulls?state=open&head=${REPO%%/*}:tdd/rebase/$TARGET")"
-          if [ "$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(0,"utf8")).length))' <<< "$existing")" != "0" ]; then
+          open_count="$(jq -r 'length' <<< "$existing")"
+          case "$open_count" in
+            ''|*[!0-9]*) echo "::error::could not read the open PR count"; exit 1 ;;
+          esac
+          if [ "$open_count" != "0" ]; then
             echo "PR already open for tdd/rebase/$TARGET"
             exit 0
           fi
@@ -154,6 +163,8 @@ jobs:
             echo "- \`cargo fmt\` on the fork-owned crates"
             echo "- \`cargo test -p infisical -p interpolate\` (including the fail-closed guard)"
             echo "- \`cargo check -p komodo_core -p komodo_periphery\`"
+            echo
+            echo "The lockfile was refreshed for this release and committed onto the branch."
             echo
             echo "**A clean rebase is not a deployment.** Before promoting, follow"
             echo "\`docs/tdd/MAINTENANCE.md\`, then build the image and re-run the canary checks in"
@@ -170,15 +181,12 @@ jobs:
             echo "Opened by the Upstream parity workflow."
           } > /tmp/parity-pr-body.md
 
-          payload="$(node -e '
-            const fs = require("fs");
-            process.stdout.write(JSON.stringify({
-              title: `Rebase onto upstream ${process.argv[1]}`,
-              head: `tdd/rebase/${process.argv[1]}`,
-              base: "tdd/patches",
-              body: fs.readFileSync(process.argv[2], "utf8"),
-            }));
-          ' "$TARGET" /tmp/parity-pr-body.md)"
+          payload="$(jq -n \
+            --arg title "Rebase onto upstream $TARGET" \
+            --arg head  "tdd/rebase/$TARGET" \
+            --arg base  "tdd/patches" \
+            --rawfile body /tmp/parity-pr-body.md \
+            '{title: $title, head: $head, base: $base, body: $body}')"
 
           curl -sS -f -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -208,10 +216,14 @@ jobs:
           fi
           title="Parity: patch series $what on upstream $TARGET"
 
-          query="$(node -e 'process.stdout.write(encodeURIComponent(`repo:${process.argv[1]} is:issue is:open in:title ${process.argv[2]}`))' "$REPO" "$title")"
-          found="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+          query="$(jq -rn --arg q "repo:$REPO is:issue is:open in:title $title" '$q|@uri')"
+          found="$(curl -sS -f -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" "$API/search/issues?q=$query")"
-          if [ "$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(0,"utf8")).total_count))' <<< "$found")" != "0" ]; then
+          total="$(jq -r '.total_count' <<< "$found")"
+          case "$total" in
+            ''|*[!0-9]*) echo "::error::could not read the open issue count"; exit 1 ;;
+          esac
+          if [ "$total" != "0" ]; then
             echo "Issue already open"
             exit 0
           fi
@@ -238,13 +250,8 @@ jobs:
             echo "Opened by the Upstream parity workflow ([run]($RUN_URL))."
           } > /tmp/parity-issue-body.md
 
-          payload="$(node -e '
-            const fs = require("fs");
-            process.stdout.write(JSON.stringify({
-              title: process.argv[1],
-              body: fs.readFileSync(process.argv[2], "utf8"),
-            }));
-          ' "$title" /tmp/parity-issue-body.md)"
+          payload="$(jq -n --arg title "$title" --rawfile body /tmp/parity-issue-body.md \
+            '{title: $title, body: $body}')"
 
           curl -sS -f -X POST -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
