@@ -1,0 +1,128 @@
+# Build and publish the fork's Komodo Core image.
+#
+# Only Core is built. Secret interpolation happens entirely in Core, so every
+# Periphery in the estate keeps running the stock upstream image -- see
+# docs/tdd/DEPLOYMENT.md.
+name: Core image
+
+on:
+  push:
+    branches: ['tdd/release/**', 'tdd/patches']
+    paths-ignore: ['docs/**', '*.md']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push the image to the registry'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: komodo-core-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: repo.indexarr.net
+  IMAGE: repo.indexarr.net/indexarr/komodo-core-infisical
+
+jobs:
+  test:
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned to the toolchain the fork's Dockerfile builds with, so CI cannot
+      # pass on a compiler the image will not use.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      # Scoped to the crates this fork owns or changes. `--all` would gate our
+      # CI on upstream's formatting, which we do not control and must not fight.
+      - name: Formatting (fork-owned crates)
+        run: cargo fmt -p infisical -p interpolate --check
+
+      - name: Unit and integration tests
+        run: cargo test -p infisical -p interpolate --locked
+
+      # The guard is the safety-critical part: if it stops failing closed, a
+      # failed secret lookup would deploy a literal token as a password.
+      - name: Guard must fail closed
+        run: |
+          cargo test -p interpolate --locked -- \
+            refuses_to_pass_through_an_unresolved_infisical_token --exact --nocapture
+
+      # Cheaper than a full image build and catches an upstream API change in
+      # the hook before we spend ten minutes compiling.
+      - name: Both binaries still build
+        run: cargo check -p komodo_core -p komodo_periphery --locked
+
+  image:
+    needs: test
+    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
+    steps:
+      - uses: actions/checkout@v7
+
+      # Authenticate to Docker Hub first: the build pulls rust, debian and deno
+      # base images from it, and unauthenticated pulls hit the shared runner's
+      # rate limit.
+      - name: Authenticate to Docker Hub (base image pull rate limit)
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: x-access-token
+          password: ${{ secrets.FORGEJO_TOKEN }}
+
+      # The upstream release this build is based on. It drives both the image
+      # tag and which upstream UI image is pulled in, so the two can never
+      # disagree.
+      - name: Resolve the upstream version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          test -n "$version"
+          echo "komodo=$version" >> "$GITHUB_OUTPUT"
+          echo "Upstream base: $version"
+
+      - name: Build and publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: scripts/tdd/core-only.Dockerfile
+          # node-b is x86_64 and is the only host running Core. No multi-arch.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+          provenance: false
+          build-args: |
+            KOMODO_VERSION=${{ steps.version.outputs.komodo }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical
+            ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.komodo }}-infisical
+
+      - name: Summary
+        run: |
+          {
+            echo "### Komodo Core image"
+            echo ""
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical"
+            echo "${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical-${{ github.sha }}"
+            echo '```'
+            echo ""
+            echo "Upstream base: \`${{ steps.version.outputs.komodo }}\` - Periphery unchanged."
+          } >> "$GITHUB_STEP_SUMMARY"

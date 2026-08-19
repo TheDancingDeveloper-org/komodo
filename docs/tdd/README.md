@@ -30,6 +30,8 @@ Crucially, this does **not** make Komodo depend on Infisical being up. The last 
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Building the one image that is needed, and rolling it out via a canary |
 | [`MAINTENANCE.md`](MAINTENANCE.md) | Staying at parity with upstream releases |
 | [`CANARY-2026-08-19.md`](CANARY-2026-08-19.md) | What the canary rollout proved, and the two defects it caught |
+| [`CICD.md`](CICD.md) | The build/publish pipeline and the automated upstream-parity watcher |
+| [`CUTOVER.md`](CUTOVER.md) | Converting the remaining 73 stacks |
 | [`CADASTRE.md`](CADASTRE.md) | Estate records this work invalidates or adds |
 
 ## Shape of the change
