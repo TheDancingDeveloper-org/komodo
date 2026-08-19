@@ -81,9 +81,28 @@ So the failure is localised rather than global:
 | `interpolate` guard | Fails **only** resources that actually reference an `infisical://` token. |
 | Everything else | Deploys and alerts normally. |
 
-### 3. Bounded staleness beats a hard outage
+### 3. Last-known-good values, persisted — so the dependency is soft
 
-Secrets are cached for `KOMODO_INFISICAL_CACHE_TTL_SECONDS` (default 300). If a refresh fails but a previous snapshot is younger than `KOMODO_INFISICAL_STALE_MAX_SECONDS` (default 3600), the cached snapshot is served with a warning. An Infisical restart should not instantly fail every deploy in the estate; the window is bounded and configurable.
+Secrets are cached for `KOMODO_INFISICAL_CACHE_TTL_SECONDS` (default 300). When a refresh fails, the last successfully read snapshot is served instead of failing.
+
+An in-memory cache alone is not enough. It survives an Infisical outage but **not a Core restart during one** — and losing both at once (a host reboot, or Infisical failing to come back) would fail every deploy that references a secret, including the deploys you would use to fix it. That is a hard dependency, and on this estate it is a shared-fate one, since Core and Infisical run on the same host.
+
+So the snapshot is also written to disk (`KOMODO_INFISICAL_CACHE_FILE`) after every successful refresh, and restored on a cold start when the live read fails. Core can then boot with Infisical completely unreachable and keep deploying with the values it last read.
+
+| State | Behaviour |
+|---|---|
+| Snapshot younger than the TTL | Served directly, no upstream call |
+| Refresh fails, snapshot in memory | Served, logged at **warn** with its age |
+| Refresh fails, cold start, snapshot on disk | Restored from disk and served, logged at **warn** |
+| Stale beyond `STALE_WARN_SECONDS` (default 3600) | Still served, logged at **error** — deploys are running on values nobody has revalidated |
+| Stale beyond `STALE_MAX_SECONDS` | Fails closed. **Unlimited by default** (`0`) |
+| No snapshot anywhere, refresh fails | Fails closed — there is nothing safe to serve |
+
+`STALE_MAX` is unlimited by default deliberately. A deploy controller is the tool you reach for *during* an incident, and refusing to deploy produces no fresher secret — it only blocks the work. Set it above zero to fail closed instead.
+
+Persistence is **opt-in**, because it writes secret values to disk in plaintext. That is a real new copy of secret material and it belongs as a visible line in the deployment, not a silent default. It does not introduce a new *class* of exposure — Komodo already stores secret Variables unencrypted in MongoDB and writes interpolated values into compose and env files on every Periphery host — and the file is written `0600` inside a `0700` directory on a private volume. The trade-off is stated here so it is chosen, not inherited.
+
+The write is atomic (temp file plus rename), so a crash mid-write cannot leave a truncated file that would later load as though it were complete. A corrupt or wrong-version file is reported as an error rather than treated as "no secrets", because those two states would otherwise be indistinguishable.
 
 ### 4. Startup validation is non-fatal on purpose
 
@@ -107,7 +126,9 @@ Read from the process environment, **not** from `CoreConfig`. This is deliberate
 | `KOMODO_INFISICAL_ENVIRONMENTS` | no | `prod` | Environment slugs, comma separated. |
 | `KOMODO_INFISICAL_SECRET_PATH` | no | `/` | Infisical folder path. |
 | `KOMODO_INFISICAL_CACHE_TTL_SECONDS` | no | `300` | Cache freshness window. |
-| `KOMODO_INFISICAL_STALE_MAX_SECONDS` | no | `3600` | How long a stale snapshot may be served if refresh fails. Must be >= the TTL. |
+| `KOMODO_INFISICAL_CACHE_FILE` | no | unset | Path to persist the last-known-good snapshot. Unset means in-memory only, which leaves a hard dependency on Infisical across a Core restart. **Set this.** |
+| `KOMODO_INFISICAL_STALE_MAX_SECONDS` | no | `0` (unlimited) | How long a stale snapshot may keep being served once refreshes fail. Above zero must be >= the TTL. |
+| `KOMODO_INFISICAL_STALE_WARN_SECONDS` | no | `3600` | Age past which a stale serve is logged at error rather than warn. |
 | `KOMODO_INFISICAL_TIMEOUT_SECONDS` | no | `15` | HTTP timeout. |
 
 Every credential variable also accepts a `_FILE` suffix (`KOMODO_INFISICAL_CLIENT_SECRET_FILE`), which is the preferred deployment form — the credential arrives as a mounted file rather than an environment variable readable by anything that can inspect the container environment.
@@ -116,7 +137,7 @@ Every credential variable also accepts a `_FILE` suffix (`KOMODO_INFISICAL_CLIEN
 
 | File | Lines | Nature |
 |---|---:|---|
-| `lib/infisical/` | ~700 | New crate |
+| `lib/infisical/` | ~1400 | New crate |
 | `lib/interpolate/src/lib.rs` | +185 | Guard + tests |
 | `bin/core/src/helpers/query.rs` | +11 | The hook |
 | `bin/core/src/main.rs` | +12 | Startup preload |

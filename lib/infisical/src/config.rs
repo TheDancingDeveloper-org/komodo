@@ -8,7 +8,7 @@
 //! upstream — which is what keeps the patch series cheap to rebase onto each
 //! new Komodo release.
 
-use std::{env, fs, time::Duration};
+use std::{env, fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, anyhow, bail};
 
@@ -20,13 +20,19 @@ pub const ENV_PROJECTS: &str = "KOMODO_INFISICAL_PROJECTS";
 pub const ENV_ENVIRONMENTS: &str = "KOMODO_INFISICAL_ENVIRONMENTS";
 pub const ENV_SECRET_PATH: &str = "KOMODO_INFISICAL_SECRET_PATH";
 pub const ENV_CACHE_TTL: &str = "KOMODO_INFISICAL_CACHE_TTL_SECONDS";
+pub const ENV_CACHE_FILE: &str = "KOMODO_INFISICAL_CACHE_FILE";
 pub const ENV_STALE_MAX: &str = "KOMODO_INFISICAL_STALE_MAX_SECONDS";
+pub const ENV_STALE_WARN: &str =
+  "KOMODO_INFISICAL_STALE_WARN_SECONDS";
 pub const ENV_TIMEOUT: &str = "KOMODO_INFISICAL_TIMEOUT_SECONDS";
 
 const DEFAULT_ENVIRONMENTS: &str = "prod";
 const DEFAULT_SECRET_PATH: &str = "/";
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
-const DEFAULT_STALE_MAX_SECONDS: u64 = 3600;
+/// 0 means "serve the last known good value for as long as the provider is
+/// unreachable". See `InfisicalConfig::stale_max` for why that is the default.
+const DEFAULT_STALE_MAX_SECONDS: u64 = 0;
+const DEFAULT_STALE_WARN_SECONDS: u64 = 3600;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
 
 /// One Infisical project/environment pair to load secrets from.
@@ -51,7 +57,22 @@ pub struct InfisicalConfig {
   pub scopes: Vec<Scope>,
   pub secret_path: String,
   pub cache_ttl: Duration,
-  pub stale_max: Duration,
+  /// How long a snapshot may keep being served once refreshes are failing.
+  ///
+  /// `None` means unlimited, and that is the default. A deploy controller is
+  /// the tool you reach for *during* an incident, so refusing to deploy at all
+  /// is worse than deploying with the last known good value -- especially as
+  /// failing produces no fresher secret, it just blocks the work. Set
+  /// `KOMODO_INFISICAL_STALE_MAX_SECONDS` above zero to fail closed instead.
+  pub stale_max: Option<Duration>,
+  /// Age past which a stale serve is logged at error rather than warn.
+  pub stale_warn: Duration,
+  /// Where to persist the last known good snapshot so it survives a Core
+  /// restart. `None` disables persistence, leaving an in-memory cache only.
+  ///
+  /// Opt-in on purpose: this writes secret values to disk, and that should be
+  /// a visible, auditable line in the deployment rather than a silent default.
+  pub cache_file: Option<PathBuf>,
   pub timeout: Duration,
 }
 
@@ -238,16 +259,30 @@ impl InfisicalConfig {
 
     let cache_ttl =
       duration_from_env(ENV_CACHE_TTL, DEFAULT_CACHE_TTL_SECONDS)?;
-    let stale_max =
-      duration_from_env(ENV_STALE_MAX, DEFAULT_STALE_MAX_SECONDS)?;
+    let stale_warn =
+      duration_from_env(ENV_STALE_WARN, DEFAULT_STALE_WARN_SECONDS)?;
     let timeout =
       duration_from_env(ENV_TIMEOUT, DEFAULT_TIMEOUT_SECONDS)?;
 
-    if stale_max < cache_ttl {
-      bail!(
-        "{ENV_STALE_MAX} ({stale_max:?}) must be >= {ENV_CACHE_TTL} ({cache_ttl:?})"
-      );
-    }
+    // Zero is not "expire immediately", it is "no limit".
+    let stale_max_raw =
+      duration_from_env(ENV_STALE_MAX, DEFAULT_STALE_MAX_SECONDS)?;
+    let stale_max = if stale_max_raw.is_zero() {
+      None
+    } else {
+      if stale_max_raw < cache_ttl {
+        bail!(
+          "{ENV_STALE_MAX} ({stale_max_raw:?}) must be >= {ENV_CACHE_TTL} ({cache_ttl:?}), or 0 for unlimited"
+        );
+      }
+      Some(stale_max_raw)
+    };
+
+    let cache_file = env::var(ENV_CACHE_FILE)
+      .ok()
+      .map(|v| v.trim().to_string())
+      .filter(|v| !v.is_empty())
+      .map(PathBuf::from);
 
     Ok(Self {
       url,
@@ -257,7 +292,65 @@ impl InfisicalConfig {
       secret_path,
       cache_ttl,
       stale_max,
+      stale_warn,
+      cache_file,
       timeout,
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parses_project_aliases() {
+    let projects = parse_projects("apps=aaa-111, cicd=bbb-222")
+      .expect("should parse");
+    assert_eq!(
+      projects,
+      vec![
+        ("apps".to_string(), "aaa-111".to_string()),
+        ("cicd".to_string(), "bbb-222".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn rejects_a_duplicate_alias() {
+    // Two projects under one alias would make `infisical://apps/...` ambiguous
+    // and silently resolve to whichever was loaded last.
+    assert!(parse_projects("apps=aaa,apps=bbb").is_err());
+  }
+
+  #[test]
+  fn rejects_an_entry_without_a_project_id() {
+    assert!(parse_projects("apps").is_err());
+    assert!(parse_projects("apps=").is_err());
+  }
+
+  #[test]
+  fn rejects_an_alias_that_would_break_the_secret_ref_convention() {
+    // Cadastre declares ^(infisical|woodpecker)://[a-z0-9-]+/[a-z0-9-]+/...
+    // so an alias outside [a-z0-9-] would produce references the estate's own
+    // convention rejects.
+    assert!(parse_projects("Apps=aaa").is_err());
+    assert!(parse_projects("my_apps=aaa").is_err());
+    assert!(parse_projects("apps/prod=aaa").is_err());
+    assert!(parse_projects("apps-2=aaa").is_ok());
+  }
+
+  #[test]
+  fn parses_and_deduplicates_environments() {
+    assert_eq!(
+      parse_environments("prod, staging ,prod")
+        .expect("should parse"),
+      vec!["prod".to_string(), "staging".to_string()]
+    );
+  }
+
+  #[test]
+  fn rejects_an_empty_environment_list() {
+    assert!(parse_environments("  ,  ").is_err());
   }
 }

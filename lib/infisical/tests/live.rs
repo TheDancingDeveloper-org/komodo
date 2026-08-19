@@ -44,7 +44,10 @@ async fn loads_secrets_from_a_live_instance() {
       3,
       "token must be <alias>/<environment>/<KEY>, found: {token}"
     );
-    assert!(!parts[2].is_empty(), "empty secret key in token: {token}");
+    assert!(
+      !parts[2].is_empty(),
+      "empty secret key in token: {token}"
+    );
     // Values may legitimately be empty strings; only the key shape is asserted.
     let _ = value;
   }
@@ -77,7 +80,11 @@ async fn caches_rather_than_refetching() {
   infisical::extend_secrets(&mut second).await;
   let cached_call = started.elapsed();
 
-  assert_eq!(first.len(), second.len(), "cached read should be identical");
+  assert_eq!(
+    first.len(),
+    second.len(),
+    "cached read should be identical"
+  );
   assert!(
     cached_call < std::time::Duration::from_millis(200),
     "second call took {cached_call:?}; expected a cache hit"

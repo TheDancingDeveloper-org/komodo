@@ -16,16 +16,18 @@ Suggested replacement:
 
 > GitOps deploy controller, core on Node B with peripheries on Node B, Hetzner, Vultr and hetzner3. Production deploys go through it, never ad hoc SSH. Runs a forked Core (`TheDancingDeveloper-org/komodo`) that resolves secrets live from Infisical at deploy time via `[[infisical://<project>/<env>/<KEY>]]` references, so stacks hold references rather than copies. Stacks still holding literal values are pre-migration leftovers, not the intended pattern.
 
-## 2. A new hard runtime dependency
+## 2. A new runtime dependency — soft, not hard
 
-`komodo depends_on infisical` is now true and should be declared.
-
-This is a genuinely new failure mode and worth stating plainly rather than burying:
+`komodo depends_on infisical` is now true and should be declared. It should be declared as a **soft** dependency, and the distinction matters enough to record:
 
 - Before: Infisical down ⇒ deploys unaffected (values were already copied in).
-- After: Infisical down ⇒ deploys **that reference Infisical** fail once the cache's stale window expires.
+- Now: Infisical down ⇒ deploys continue using the **last-known-good snapshot**, which is persisted to disk and survives a Core restart.
 
-Mitigations already in the design: a TTL cache, a bounded serve-stale window, and localised failure so only resources that actually reference a token are affected. But the dependency is real.
+Core only fails to resolve a reference if it has *never* successfully read that secret. An outage degrades freshness, not availability.
+
+This matters especially because Komodo Core and Infisical both run on `node-b`, so they share fate. Without persistence, losing that host would mean the deploy controller could not be used to recover the secret store it depends on. With it, Core cold-starts from disk and the recovery path stays open.
+
+The residual risk to record is the inverse one: during a long outage, deploys run on values nobody has revalidated. That is logged at error level past `KOMODO_INFISICAL_STALE_WARN_SECONDS`, and `KOMODO_INFISICAL_STALE_MAX_SECONDS` can be set to fail closed instead.
 
 It also carries **shared-fate risk**: Komodo Core and Infisical both run on `node-b`. Losing that host loses both, and the deploy controller cannot be used to recover the secret store it depends on. That is not a reason to avoid the integration — the drift it removes is a daily problem, whereas this is a host-loss problem — but it should be a declared, known property rather than a surprise during an incident.
 
@@ -35,6 +37,8 @@ Komodo consumes a new credential: its own Infisical machine identity.
 
 - `komodo consumes_secret homelab-komodo-infisical-client-id`
 - `komodo consumes_secret homelab-komodo-infisical-client-secret`
+
+Worth noting for anyone assessing exposure on `node-b`: with persistence enabled, Komodo Core also holds a plaintext copy of every secret it is scoped to, in a `0600` file on a private volume. That is a deliberate trade-off for availability, documented in `DESIGN.md`, and is the same trust level as the secret Variables Komodo already stores unencrypted in MongoDB.
 
 Both live in Infisical `apps/prod`. Per [`DEPLOYMENT.md`](DEPLOYMENT.md) this must be a **dedicated read-only identity**, not the `mydevenv2-agents` identity, which holds read/write admin on `apps` and `cicd`.
 

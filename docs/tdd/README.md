@@ -35,7 +35,7 @@ Six upstream files, **224 insertions, zero deletions**, plus one self-contained 
 
 | File | Lines | Nature |
 |---|---:|---|
-| `lib/infisical/` | ~700 | New crate — the provider |
+| `lib/infisical/` | ~1400 | New crate — the provider |
 | `lib/interpolate/src/lib.rs` | +185 | Fail-closed guard + tests |
 | `bin/core/src/helpers/query.rs` | +11 | The hook |
 | `bin/core/src/main.rs` | +12 | Startup validation |

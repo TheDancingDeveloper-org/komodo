@@ -72,7 +72,21 @@ Add to the `komodo-core` service:
       KOMODO_INFISICAL_ENVIRONMENTS: "prod"
       KOMODO_INFISICAL_CLIENT_ID_FILE: "/run/secrets/infisical_client_id"
       KOMODO_INFISICAL_CLIENT_SECRET_FILE: "/run/secrets/infisical_client_secret"
+      KOMODO_INFISICAL_CACHE_FILE: "/var/lib/komodo/infisical-cache.json"
+    volumes:
+      - komodo-secret-cache:/var/lib/komodo
 ```
+
+and alongside the existing `komodo-keys` / `periphery-keys` entries:
+
+```yaml
+volumes:
+  komodo-secret-cache:
+```
+
+**Set `KOMODO_INFISICAL_CACHE_FILE`.** Without it the cache is in-memory only, which means Core cannot cold-start while Infisical is down — a hard dependency between two services that run on the same host. With it, Core boots from the last-known-good snapshot and keeps deploying. See `DESIGN.md` for the staleness policy and the plaintext-on-disk trade-off this accepts.
+
+Use a dedicated volume rather than reusing `komodo-keys`: this file holds every secret the provider is scoped to, and it is easier to reason about, back up and destroy on its own.
 
 Prefer the `_FILE` form. It keeps the credential out of the container environment, where anything able to inspect the container can read it.
 
@@ -122,6 +136,21 @@ TEST=[[infisical://apps/prod/DEFINITELY_NOT_A_REAL_KEY]]
 ```
 
 The deploy must **fail** with `unresolved secret reference`. If it instead succeeds and the container receives the literal string `[[infisical://...]]`, the guard is not working — stop and investigate before converting anything else.
+
+**6. Prove it survives an Infisical outage.** This is the step that verifies the dependency is actually soft. With a converted stack deployed and working:
+
+```bash
+# Confirm the snapshot has been persisted
+tailscale ssh sprooty@winrarhost \
+  'docker exec komodo-core sh -c "ls -l /var/lib/komodo/infisical-cache.json"'
+
+# Stop Infisical, restart Core so nothing is cached in memory, redeploy
+tailscale ssh sprooty@winrarhost 'docker stop infisical && docker restart komodo-core'
+```
+
+Core's log should show `Restored the last-known-good Infisical snapshot from disk` and `Started with the last known good Infisical secrets`, and the converted stack should still deploy. Start Infisical again afterwards and confirm the log returns to `Loaded secrets from Infisical`.
+
+Choose the timing: this stops the estate's secret store briefly.
 
 ## Rollback
 
