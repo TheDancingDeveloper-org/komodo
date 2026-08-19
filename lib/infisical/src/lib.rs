@@ -51,7 +51,15 @@ use tokio::sync::{Mutex, RwLock};
 
 mod client;
 mod config;
-mod persist;
+
+/// Authenticated encryption for the on-disk snapshot.
+///
+/// Public so the file format is inspectable and testable: the snapshot is part
+/// of this fork's operational contract, documented in `docs/tdd/DESIGN.md`.
+pub mod crypto;
+/// Reading and writing the encrypted last-known-good snapshot. Public for the
+/// same reason as [`crypto`].
+pub mod persist;
 
 pub use config::{InfisicalConfig, Scope, enabled};
 
@@ -138,7 +146,11 @@ impl ProviderState {
     if let Some(path) = &self.client.config().cache_file {
       let snapshot =
         persist::snapshot_from(&secrets, self.scope_names());
-      if let Err(error) = persist::save(path, &snapshot) {
+      if let Err(error) = persist::save(
+        path,
+        &snapshot,
+        &self.client.config().client_secret,
+      ) {
         tracing::error!(
           path = %path.display(),
           "Failed to persist the Infisical snapshot; Core will not be able to \
@@ -160,7 +172,7 @@ impl ProviderState {
       return;
     }
 
-    match persist::load(path) {
+    match persist::load(path, &self.client.config().client_secret) {
       Ok(None) => {
         tracing::warn!(
           path = %path.display(),
@@ -183,9 +195,13 @@ impl ProviderState {
         });
       }
       Err(error) => {
+        // Most often the Infisical client secret was rotated, which makes the
+        // old snapshot undecryptable by design. Nothing to recover; the next
+        // successful refresh writes a fresh one.
         tracing::error!(
           path = %path.display(),
-          "Could not read the persisted Infisical snapshot: {error:#}"
+          "Could not read the persisted Infisical snapshot; it will be replaced \
+           on the next successful refresh: {error:#}"
         );
       }
     }

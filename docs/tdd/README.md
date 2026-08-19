@@ -19,7 +19,7 @@ A stack now holds a *reference*:
 
 Rotating the value in Infisical takes effect on the next deploy, with no stack edit. The reference form matches the estate's existing Cadastre `secret_ref` convention.
 
-Crucially, this does **not** make Komodo depend on Infisical being up. The last successfully read values are cached and persisted to disk, so Core can cold-start with Infisical completely unreachable and keep deploying. An outage costs freshness, not availability.
+Crucially, this does **not** make Komodo depend on Infisical being up. The last successfully read values are cached and persisted to disk — **encrypted with AES-256-GCM** — so Core can cold-start with Infisical completely unreachable and keep deploying. An outage costs freshness, not availability.
 
 ## Documents
 
@@ -71,7 +71,8 @@ mydevenv2-agent-auth run -- python3 scripts/tdd/audit-komodo-secrets.py   # re-r
 |---|---|
 | Provider crate, guard, Core hook | Done — builds and tests pass on v2.2.0 and v2.3.2 |
 | Last-known-good persistence (survives a Core restart) | Done — proven by `tests/cold_start.rs` |
-| Core image (`linux/amd64`) | Built — `komodo-core-infisical:2.2.0-infisical.2` |
+| Snapshot encrypted at rest (AES-256-GCM) | Done — no secret value or name is readable on disk |
+| Core image (`linux/amd64`) | Built — `komodo-core-infisical:2.2.0-infisical.3` |
 | Deployed to Node B | **Not yet** — canary rollout is a human go/no-go, see [`DEPLOYMENT.md`](DEPLOYMENT.md) |
 | Dedicated Infisical identity for Komodo | **Not yet** — needs Infisical org admin, cannot be done by an agent |
 | Migrating the 180 literals | **Not started** — deliberately out of scope for this build |
