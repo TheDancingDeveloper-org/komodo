@@ -210,7 +210,7 @@ impl InfisicalClient {
         // Listable but not readable by this identity. Skipping leaves the
         // token unresolved, which the interpolation guard turns into a loud
         // failure — far better than substituting an empty value.
-        tracing::warn!(
+        tracing::warn!(target: crate::LOG_TARGET,
           scope = %format!("{}/{}", scope.alias, scope.environment),
           key = %entry.secret_key,
           "Infisical secret value is hidden from the Komodo identity; skipping"

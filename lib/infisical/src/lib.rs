@@ -73,6 +73,19 @@ use client::InfisicalClient;
 /// binary for the sake of one string constant.
 pub const TOKEN_PREFIX: &str = "infisical://";
 
+/// Tracing target for everything this crate emits.
+///
+/// Komodo Core's logger is `Targets::new().with_default(LevelFilter::OFF)` with
+/// an explicit allow-list (`km`, `core`, `periphery`, ...), so a crate that logs
+/// under its own name is silently discarded. That would be quietly disastrous
+/// here: the whole degraded-mode design rests on the provider logging loudly
+/// when it falls back to stale values.
+///
+/// `Targets` matches directives by `starts_with`, so prefixing with `core::`
+/// means the existing allow-list picks these up while they stay filterable as a
+/// distinct target -- and no upstream file has to be touched to enable them.
+pub const LOG_TARGET: &str = "core::infisical";
+
 /// Build the interpolation token for a secret.
 pub fn token_for(
   alias: &str,
@@ -151,7 +164,7 @@ impl ProviderState {
         &snapshot,
         &self.client.config().client_secret,
       ) {
-        tracing::error!(
+        tracing::error!(target: LOG_TARGET,
           path = %path.display(),
           "Failed to persist the Infisical snapshot; Core will not be able to \
            cold-start with these values if Infisical is unreachable: {error:#}"
@@ -174,14 +187,14 @@ impl ProviderState {
 
     match persist::load(path, &self.client.config().client_secret) {
       Ok(None) => {
-        tracing::warn!(
+        tracing::warn!(target: LOG_TARGET,
           path = %path.display(),
           "No persisted Infisical snapshot to fall back on"
         );
       }
       Ok(Some(stored)) => {
         let age = persist::age_seconds(stored.fetched_at_unix);
-        tracing::warn!(
+        tracing::warn!(target: LOG_TARGET,
           path = %path.display(),
           count = stored.secrets.len(),
           age_seconds = age,
@@ -198,7 +211,7 @@ impl ProviderState {
         // Most often the Infisical client secret was rotated, which makes the
         // old snapshot undecryptable by design. Nothing to recover; the next
         // successful refresh writes a fresh one.
-        tracing::error!(
+        tracing::error!(target: LOG_TARGET,
           path = %path.display(),
           "Could not read the persisted Infisical snapshot; it will be replaced \
            on the next successful refresh: {error:#}"
@@ -238,13 +251,13 @@ impl ProviderState {
     // means deploys have been running on values nobody has revalidated, which
     // deserves to look like a problem.
     if age >= config.stale_warn.as_secs() {
-      tracing::error!(
+      tracing::error!(target: LOG_TARGET,
         age_seconds = age,
         "Infisical has been unreachable for a long time; still deploying with \
          the last known good secrets, which may now be out of date: {error:#}"
       );
     } else {
-      tracing::warn!(
+      tracing::warn!(target: LOG_TARGET,
         age_seconds = age,
         "Infisical refresh failed; serving the last known good secrets: {error:#}"
       );
@@ -292,7 +305,7 @@ fn state() -> Result<&'static Arc<ProviderState>, &'static String> {
         .map(|scope| format!("{}/{}", scope.alias, scope.environment))
         .collect::<Vec<_>>()
         .join(", ");
-      tracing::info!(
+      tracing::info!(target: LOG_TARGET,
         url = %config.url,
         scopes = %scopes,
         cache_ttl_seconds = config.cache_ttl.as_secs(),
@@ -332,7 +345,7 @@ pub async fn preload() -> anyhow::Result<()> {
   };
   match age {
     Some(age) if age > state.client.config().cache_ttl.as_secs() => {
-      tracing::warn!(
+      tracing::warn!(target: LOG_TARGET,
         count = secrets.len(),
         age_seconds = age,
         "Started with the last known good Infisical secrets; a live refresh did \
@@ -340,7 +353,7 @@ pub async fn preload() -> anyhow::Result<()> {
       );
     }
     _ => {
-      tracing::info!(
+      tracing::info!(target: LOG_TARGET,
         count = secrets.len(),
         "Loaded secrets from Infisical"
       );
@@ -361,7 +374,7 @@ pub async fn extend_secrets(secrets: &mut HashMap<String, String>) {
   let state = match state() {
     Ok(state) => state,
     Err(error) => {
-      tracing::error!(
+      tracing::error!(target: LOG_TARGET,
         "Infisical secret provider is enabled but misconfigured; \
          no Infisical secrets will be available: {error}"
       );
@@ -376,7 +389,7 @@ pub async fn extend_secrets(secrets: &mut HashMap<String, String>) {
       }
     }
     Err(error) => {
-      tracing::error!(
+      tracing::error!(target: LOG_TARGET,
         "Failed to load secrets from Infisical; any resource referencing an \
          '{TOKEN_PREFIX}' token will fail to deploy: {error:#}"
       );
