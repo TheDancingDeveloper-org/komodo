@@ -25,9 +25,13 @@ The C class splits further:
 
 ## Recommended sequence
 
-### Phase 0 — remove the single point of fragility (do first, 5 min)
+### Phase 0 — put the image on a durable, repeatable footing (do first)
 
-The Core image exists **only in Node B's local daemon** (`pull_policy: never`); it was never pushed. If that daemon loses its images, Komodo Core will not start. Push it to a registry and switch the compose to a pull-able reference before converting anything else.
+The Core image originally existed **only in Node B's local daemon** (`pull_policy: never`) and was never pushed — if that daemon lost its images, Komodo Core would not start.
+
+Now handled by CI rather than a one-off push. See [`CICD.md`](CICD.md): a `Core image` workflow builds and publishes to `repo.indexarr.net` on every push to the release branches, and an `Upstream parity` workflow replays the patch series onto each new upstream release, opening a PR when it applies cleanly and an issue when it does not.
+
+Remaining manual step: switch the compose from the local tag to a published, immutable `…-infisical-<sha>` tag.
 
 ### Phase 1 — the 26 A-class (low risk, high confidence)
 
