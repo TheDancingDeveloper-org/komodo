@@ -84,7 +84,9 @@ volumes:
   komodo-secret-cache:
 ```
 
-**Set `KOMODO_INFISICAL_CACHE_FILE`.** Without it the cache is in-memory only, which means Core cannot cold-start while Infisical is down — a hard dependency between two services that run on the same host. With it, Core boots from the last-known-good snapshot and keeps deploying. See `DESIGN.md` for the staleness policy and the plaintext-on-disk trade-off this accepts.
+**Set `KOMODO_INFISICAL_CACHE_FILE`.** Without it the cache is in-memory only, which means Core cannot cold-start while Infisical is down — a hard dependency between two services that run on the same host. With it, Core boots from the last-known-good snapshot and keeps deploying.
+
+The file is **encrypted** (AES-256-GCM, key derived from the Infisical client secret) and written `0600`, so a volume backup or disk image of it is inert. See `DESIGN.md` for the staleness policy and exactly what that encryption does and does not protect against.
 
 Use a dedicated volume rather than reusing `komodo-keys`: this file holds every secret the provider is scoped to, and it is easier to reason about, back up and destroy on its own.
 
@@ -140,13 +142,15 @@ The deploy must **fail** with `unresolved secret reference`. If it instead succe
 **6. Prove it survives an Infisical outage.** This is the step that verifies the dependency is actually soft. With a converted stack deployed and working:
 
 ```bash
-# Confirm the snapshot has been persisted
+# Confirm the snapshot has been persisted, and that it is opaque
 tailscale ssh sprooty@winrarhost \
-  'docker exec komodo-core sh -c "ls -l /var/lib/komodo/infisical-cache.json"'
+  'docker exec komodo-core sh -c "ls -l /var/lib/komodo/infisical-cache.json && head -c 200 /var/lib/komodo/infisical-cache.json"'
 
 # Stop Infisical, restart Core so nothing is cached in memory, redeploy
 tailscale ssh sprooty@winrarhost 'docker stop infisical && docker restart komodo-core'
 ```
+
+You should see mode `-rw-------` and a JSON envelope with `"cipher": "aes-256-gcm"` and a base64 `ciphertext` — no readable secret names or values.
 
 Core's log should show `Restored the last-known-good Infisical snapshot from disk` and `Started with the last known good Infisical secrets`, and the converted stack should still deploy. Start Infisical again afterwards and confirm the log returns to `Loaded secrets from Infisical`.
 
