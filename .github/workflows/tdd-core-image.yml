@@ -65,6 +65,14 @@ jobs:
   image:
     needs: test
     runs-on: [self-hosted, node-b, linux, x64, publish, docker]
+    # Serialised across ALL refs, not just this one. The workflow-level group is
+    # ref-scoped, so pushing tdd/patches and tdd/release/* together started two
+    # full Rust release builds on the same node-b daemon at once and one died
+    # with a buildx transport error. `cancel-in-progress: false` so a release
+    # build queues behind a patches build rather than being thrown away.
+    concurrency:
+      group: komodo-core-image-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
