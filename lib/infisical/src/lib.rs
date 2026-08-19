@@ -44,7 +44,10 @@
 
 use std::{
   collections::HashMap,
-  sync::{Arc, OnceLock},
+  sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
 use tokio::sync::{Mutex, RwLock};
@@ -108,6 +111,13 @@ struct ProviderState {
   /// Held across a refresh so a burst of concurrent deploys triggers one
   /// upstream fetch rather than one per deploy.
   refresh: Mutex<()>,
+  /// Whether the values currently being served came from a failed refresh.
+  ///
+  /// Tracked explicitly rather than inferred from snapshot age. A snapshot can
+  /// be younger than the TTL and still be all we have -- exactly what happens
+  /// when Core restarts during a brief outage -- and reporting that as a
+  /// healthy load would tell an operator the opposite of the truth.
+  degraded: AtomicBool,
 }
 
 impl ProviderState {
@@ -144,6 +154,7 @@ impl ProviderState {
 
     let secrets = Arc::new(merged);
     let fetched_at_unix = persist::now_unix();
+    self.degraded.store(false, Ordering::Relaxed);
 
     {
       let mut guard = self.cache.write().await;
@@ -236,6 +247,7 @@ impl ProviderState {
 
     let age = persist::age_seconds(snapshot.fetched_at_unix);
     let config = self.client.config();
+    self.degraded.store(true, Ordering::Relaxed);
 
     if let Some(max) = config.stale_max {
       if age > max.as_secs() {
@@ -317,6 +329,7 @@ fn state() -> Result<&'static Arc<ProviderState>, &'static String> {
         client,
         cache: RwLock::new(None),
         refresh: Mutex::new(()),
+        degraded: AtomicBool::new(false),
       }))
     })
     .as_ref()
@@ -337,27 +350,27 @@ pub async fn preload() -> anyhow::Result<()> {
   // Report whether these values came from Infisical just now or from the
   // persisted fallback, so a cold start during an outage is obvious in the log
   // rather than looking like a normal healthy boot.
-  let age = {
-    let guard = state.cache.read().await;
-    guard
-      .as_ref()
-      .map(|s| persist::age_seconds(s.fetched_at_unix))
-  };
-  match age {
-    Some(age) if age > state.client.config().cache_ttl.as_secs() => {
-      tracing::warn!(target: LOG_TARGET,
-        count = secrets.len(),
-        age_seconds = age,
-        "Started with the last known good Infisical secrets; a live refresh did \
-         not succeed"
-      );
-    }
-    _ => {
-      tracing::info!(target: LOG_TARGET,
-        count = secrets.len(),
-        "Loaded secrets from Infisical"
-      );
-    }
+  if state.degraded.load(Ordering::Relaxed) {
+    let age = {
+      let guard = state.cache.read().await;
+      guard
+        .as_ref()
+        .map(|s| persist::age_seconds(s.fetched_at_unix))
+        .unwrap_or_default()
+    };
+    tracing::warn!(
+      target: LOG_TARGET,
+      count = secrets.len(),
+      age_seconds = age,
+      "Started with the last known good Infisical secrets; a live refresh did \
+       not succeed"
+    );
+  } else {
+    tracing::info!(
+      target: LOG_TARGET,
+      count = secrets.len(),
+      "Loaded secrets from Infisical"
+    );
   }
   Ok(())
 }
