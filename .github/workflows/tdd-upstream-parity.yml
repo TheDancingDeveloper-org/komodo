@@ -32,7 +32,9 @@ concurrency:
 
 jobs:
   parity:
-    runs-on: [self-hosted, node-b, linux, x64, rust]
+    # Pure Rust plus git/curl/jq; nothing here is node-b specific, so this
+    # daily job does not need to queue behind node-b's publish work.
+    runs-on: [self-hosted, linux, x64, rust]
     steps:
       - uses: actions/checkout@v7
         with:
