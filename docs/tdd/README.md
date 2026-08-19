@@ -19,6 +19,8 @@ A stack now holds a *reference*:
 
 Rotating the value in Infisical takes effect on the next deploy, with no stack edit. The reference form matches the estate's existing Cadastre `secret_ref` convention.
 
+Crucially, this does **not** make Komodo depend on Infisical being up. The last successfully read values are cached and persisted to disk, so Core can cold-start with Infisical completely unreachable and keep deploying. An outage costs freshness, not availability.
+
 ## Documents
 
 | Document | What it covers |
@@ -68,7 +70,8 @@ mydevenv2-agent-auth run -- python3 scripts/tdd/audit-komodo-secrets.py   # re-r
 | Item | State |
 |---|---|
 | Provider crate, guard, Core hook | Done — builds and tests pass on v2.2.0 and v2.3.2 |
-| Core image (`linux/amd64`) | Built |
+| Last-known-good persistence (survives a Core restart) | Done — proven by `tests/cold_start.rs` |
+| Core image (`linux/amd64`) | Built — `komodo-core-infisical:2.2.0-infisical.2` |
 | Deployed to Node B | **Not yet** — canary rollout is a human go/no-go, see [`DEPLOYMENT.md`](DEPLOYMENT.md) |
 | Dedicated Infisical identity for Komodo | **Not yet** — needs Infisical org admin, cannot be done by an agent |
 | Migrating the 180 literals | **Not started** — deliberately out of scope for this build |
