@@ -47,8 +47,10 @@ What it does:
 1. Fetches upstream tags and works out the release tag the patch series currently sits on, versus the newest upstream release. Prereleases (`-dev-N`) are ignored — they are not parity targets.
 2. If they match, it stops. Most days are a no-op.
 3. Otherwise it replays the series onto the new tag and verifies it: formatting, tests (including the fail-closed guard), and `cargo check` on both binaries.
-4. **Clean →** pushes `tdd/rebase/<tag>` and opens a PR into `tdd/patches`.
+4. **Clean →** pushes `tdd/rebase/<tag>` and opens an issue saying it is ready to promote, with the branch link, a compare link and the exact promote commands.
    **Conflicted or failing →** opens an issue naming the conflicted files and pointing at the conflict table in [`MAINTENANCE.md`](MAINTENANCE.md), and fails the run.
+
+It reports a clean rebase as an **issue rather than a pull request** on purpose. The organization disallows GitHub Actions creating or approving PRs, across every repo — a deliberate security control, and not one this workflow should have loosened for its own convenience. The branch is pushed and ready; open the PR by hand if you want one.
 
 Both paths are idempotent: an existing open PR or issue is not duplicated on the next run.
 
@@ -63,6 +65,18 @@ Repo-level, sourced from Infisical:
 | `FORGEJO_TOKEN` | `cicd/prod/FORGEJO_TOKEN` | Push to `repo.indexarr.net` |
 | `DOCKERHUB_USERNAME` | `apps/prod/HOMELAB_SECSCAN_DOCKERHUB_USERNAME` | Base image pull rate limit |
 | `DOCKERHUB_TOKEN` | `cicd/prod/DOCKEHUB_PAT_sprooty` | Base image pull rate limit |
+
+## Enabling this on a new fork
+
+Three org-level gates had to be opened, all of them opt-in allowlists rather than blanket policy:
+
+1. **Actions enabled for the repo** — the org runs `enabled_repositories: selected`; the repo was added to the allowlist.
+2. **Runner group access** — the `public-node-b` group is `visibility: selected`; the repo was added there too, otherwise jobs sit `queued` forever against online runners with no error.
+3. **Default branch** — set to `tdd/patches`. `schedule` and `workflow_dispatch` only fire from the default branch, so with the workflows on a side branch neither would ever run. `main` remains the pristine upstream mirror.
+
+The one gate deliberately **not** opened is Actions creating pull requests. See above.
+
+Note the runner image has **no `gh` and no `node`** — it does have `curl`, `jq`, `git` and `python3`. The workflows use `jq`.
 
 These are copies, and will drift if the Infisical originals are rotated — the same class of problem this fork exists to fix, one layer up. Re-run the setup in this document's history after any rotation. GitHub Actions has no equivalent of the reference mechanism, so this is a genuine and accepted limitation, not an oversight.
 
