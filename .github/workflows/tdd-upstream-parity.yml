@@ -1,0 +1,207 @@
+# Keep the fork at parity with upstream Komodo.
+#
+# Watches moghtech/komodo for new releases, replays this fork's patch series
+# onto each one, and proves the result still builds and still fails closed.
+# On success it opens a PR; on conflict or failure it opens an issue saying
+# exactly what broke. Nothing is merged or deployed automatically.
+name: Upstream parity
+
+on:
+  schedule:
+    # Daily, well outside the estate's backup and collector windows.
+    - cron: '17 14 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to rebase onto (default: newest release)'
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: komodo-upstream-parity
+  cancel-in-progress: false
+
+jobs:
+  parity:
+    runs-on: [self-hosted, node-b, linux, x64, rust]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Work out whether upstream has moved
+        id: check
+        run: |
+          set -euo pipefail
+          git config user.name  "komodo-parity-bot"
+          git config user.email "sprooty@sprooty.com"
+          git remote add upstream https://github.com/moghtech/komodo.git 2>/dev/null || true
+          git fetch --tags --quiet upstream
+          git branch -f tdd/patches origin/tdd/patches
+
+          if [ -n "${{ inputs.tag }}" ]; then
+            target="${{ inputs.tag }}"
+            git rev-parse --verify --quiet "refs/tags/$target" >/dev/null \
+              || { echo "::error::tag $target does not exist upstream"; exit 1; }
+          else
+            # Release tags only -- upstream also publishes -dev-N prereleases,
+            # which are not parity targets.
+            target="$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-dev-' | head -1)"
+          fi
+
+          # The tag the series currently sits on. The series is short, so its
+          # base is the newest tag that is an ancestor of its root commit.
+          base="$(git describe --tags --abbrev=0 --exclude='*-dev-*' \
+                  "$(git rev-list tdd/patches --not --tags='v[0-9]*' | tail -1)^" 2>/dev/null || true)"
+
+          echo "base=$base"     >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          if [ "$base" = "$target" ]; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "Already based on $target - nothing to do."
+          else
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream moved: $base -> $target"
+          fi
+
+      - name: Replay the patch series onto the new release
+        id: rebase
+        if: steps.check.outputs.uptodate == 'false'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git checkout -q -B "tdd/rebase/${{ steps.check.outputs.target }}" tdd/patches
+          git rebase --onto "${{ steps.check.outputs.target }}" "${{ steps.check.outputs.base }}"
+
+      - name: Capture the conflict, if it did not apply cleanly
+        id: conflict
+        if: steps.check.outputs.uptodate == 'false' && steps.rebase.outcome == 'failure'
+        run: |
+          {
+            echo 'files<<CONFLICT_EOF'
+            git diff --name-only --diff-filter=U || true
+            echo 'CONFLICT_EOF'
+          } >> "$GITHUB_OUTPUT"
+          git rebase --abort || true
+
+      - name: Verify the rebased series
+        id: verify
+        if: steps.check.outputs.uptodate == 'false' && steps.rebase.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo fmt -p infisical -p interpolate --check
+          cargo test -p infisical -p interpolate --locked
+          cargo check -p komodo_core -p komodo_periphery --locked
+
+      - name: Publish the rebased branch and open a PR
+        if: steps.check.outputs.uptodate == 'false' && steps.rebase.outcome == 'success' && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.check.outputs.target }}
+          BASE: ${{ steps.check.outputs.base }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "tdd/rebase/$TARGET"
+          open_prs="$(gh pr list --head "tdd/rebase/$TARGET" --state open --json number --jq 'length')"
+          if [ "$open_prs" != "0" ]; then
+            echo "PR already open for tdd/rebase/$TARGET"
+            exit 0
+          fi
+          {
+            echo "Upstream released \`$TARGET\`. The patch series replayed from \`$BASE\` with no"
+            echo "conflicts, and passed:"
+            echo
+            echo "- \`cargo fmt\` on the fork-owned crates"
+            echo "- \`cargo test -p infisical -p interpolate\` (including the fail-closed guard)"
+            echo "- \`cargo check -p komodo_core -p komodo_periphery\`"
+            echo
+            echo "**A clean rebase is not a deployment.** Before promoting, follow"
+            echo "\`docs/tdd/MAINTENANCE.md\`, then build the image and re-run the canary checks in"
+            echo "\`docs/tdd/CANARY-2026-08-19.md\` -- both defects found so far were invisible to"
+            echo "the test suite and only appeared against a live Core."
+            echo
+            echo "Promoting:"
+            echo
+            echo '```'
+            echo "git branch -f tdd/patches         tdd/rebase/$TARGET"
+            echo "git branch -f tdd/release/$TARGET tdd/rebase/$TARGET"
+            echo '```'
+            echo
+            echo "Opened by the Upstream parity workflow."
+          } > /tmp/parity-pr-body.md
+          gh pr create --base tdd/patches --head "tdd/rebase/$TARGET" \
+            --title "Rebase onto upstream $TARGET" --body-file /tmp/parity-pr-body.md
+
+      - name: Report a conflict or a failed verification
+        if: steps.check.outputs.uptodate == 'false' && (steps.rebase.outcome == 'failure' || steps.verify.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.check.outputs.target }}
+          BASE: ${{ steps.check.outputs.base }}
+          CONFLICTS: ${{ steps.conflict.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.rebase.outcome }}" = "failure" ]; then
+            what="conflicted"
+          else
+            what="failed verification"
+          fi
+          title="Parity: patch series $what on upstream $TARGET"
+          open_issues="$(gh issue list --state open --search "$title in:title" --json number --jq 'length')"
+          if [ "$open_issues" != "0" ]; then
+            echo "Issue already open"
+            exit 0
+          fi
+          {
+            echo "Replaying the patch series from \`$BASE\` onto upstream \`$TARGET\` **$what**."
+            echo
+            echo "Conflicted files (empty if verification failed rather than the rebase):"
+            echo '```'
+            echo "${CONFLICTS:-none}"
+            echo '```'
+            echo
+            echo "Only four upstream files are touched by this series, so diagnosis is quick --"
+            echo "see the conflict table in \`docs/tdd/MAINTENANCE.md\`. To reproduce locally:"
+            echo
+            echo '```'
+            echo "./scripts/tdd/sync-upstream.sh $TARGET"
+            echo '```'
+            echo
+            echo "If the conflict is in \`Cargo.toml\`, keep **upstream's** dependency versions and"
+            echo "re-add ours, and make sure they sit in the trailing \`# FORK\` block -- that block"
+            echo "exists precisely to stop this recurring."
+            echo
+            echo "Opened by the Upstream parity workflow ([run]($RUN_URL))."
+          } > /tmp/parity-issue-body.md
+          gh issue create --title "$title" --body-file /tmp/parity-issue-body.md
+
+      - name: Fail the run if parity is broken
+        if: steps.check.outputs.uptodate == 'false' && (steps.rebase.outcome == 'failure' || steps.verify.outcome == 'failure')
+        run: exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Upstream parity"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Series base | \`${{ steps.check.outputs.base }}\` |"
+            echo "| Newest upstream release | \`${{ steps.check.outputs.target }}\` |"
+            echo "| Up to date | ${{ steps.check.outputs.uptodate }} |"
+            echo "| Rebase | ${{ steps.rebase.outcome || 'skipped' }} |"
+            echo "| Verify | ${{ steps.verify.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
