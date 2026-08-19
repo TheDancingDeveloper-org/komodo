@@ -100,9 +100,19 @@ So the snapshot is also written to disk (`KOMODO_INFISICAL_CACHE_FILE`) after ev
 
 `STALE_MAX` is unlimited by default deliberately. A deploy controller is the tool you reach for *during* an incident, and refusing to deploy produces no fresher secret — it only blocks the work. Set it above zero to fail closed instead.
 
-Persistence is **opt-in**, because it writes secret values to disk in plaintext. That is a real new copy of secret material and it belongs as a visible line in the deployment, not a silent default. It does not introduce a new *class* of exposure — Komodo already stores secret Variables unencrypted in MongoDB and writes interpolated values into compose and env files on every Periphery host — and the file is written `0600` inside a `0700` directory on a private volume. The trade-off is stated here so it is chosen, not inherited.
+### The snapshot is encrypted at rest
 
-The write is atomic (temp file plus rename), so a crash mid-write cannot leave a truncated file that would later load as though it were complete. A corrupt or wrong-version file is reported as an error rather than treated as "no secrets", because those two states would otherwise be indistinguishable.
+Secret values are **never** written to disk in the clear.
+
+The snapshot is sealed with **AES-256-GCM**, under a key derived by **HKDF-SHA256** from the provider's own Infisical client secret plus a random 32-byte per-file salt. The header (version, algorithms, salt, nonce) is bound in as associated data, so it cannot be swapped without the authentication tag failing. Primitives come from `aws-lc-rs`, which Komodo Core already compiles in and installs as its rustls crypto provider — so this adds **no new dependency**.
+
+**Why the key is the client secret.** There is no separate key to generate, mount, rotate or lose. The security property is worth stating precisely: this does *not* defend against an attacker who has already compromised the Core container, because such an attacker holds the client secret and can simply ask Infisical for the same values directly — no local key material could help there. What it defends is the file *away from that process*: volume backups, disk images, docker volume snapshots, a stray `cp`, or anyone with read access to the host filesystem. Those are the realistic ways a cache file leaks, and against all of them the file is inert.
+
+It also fails safe on rotation. Rotate the Infisical credential and the old snapshot simply stops decrypting, so the provider discards it and re-fetches. No ciphertext outlives the credential that produced it, and there is no manual re-keying step.
+
+Verified against the live instance: with all 261 estate secrets cached, the file on disk contains no secret value, **no secret name**, and not even the `infisical://` token prefix.
+
+Defence in depth on top of that: written `0600` inside a `0700` directory, and written atomically (temp file plus rename) so a crash mid-write cannot leave a truncated file that would later load as though complete. A corrupt file, a wrong-version file, or a pre-encryption plaintext file is reported as an error rather than treated as "no secrets" — those states would otherwise be indistinguishable while meaning very different things.
 
 ### 4. Startup validation is non-fatal on purpose
 
@@ -126,7 +136,7 @@ Read from the process environment, **not** from `CoreConfig`. This is deliberate
 | `KOMODO_INFISICAL_ENVIRONMENTS` | no | `prod` | Environment slugs, comma separated. |
 | `KOMODO_INFISICAL_SECRET_PATH` | no | `/` | Infisical folder path. |
 | `KOMODO_INFISICAL_CACHE_TTL_SECONDS` | no | `300` | Cache freshness window. |
-| `KOMODO_INFISICAL_CACHE_FILE` | no | unset | Path to persist the last-known-good snapshot. Unset means in-memory only, which leaves a hard dependency on Infisical across a Core restart. **Set this.** |
+| `KOMODO_INFISICAL_CACHE_FILE` | no | unset | Path to persist the last-known-good snapshot, encrypted. Unset means in-memory only, which leaves a hard dependency on Infisical across a Core restart. **Set this.** |
 | `KOMODO_INFISICAL_STALE_MAX_SECONDS` | no | `0` (unlimited) | How long a stale snapshot may keep being served once refreshes fail. Above zero must be >= the TTL. |
 | `KOMODO_INFISICAL_STALE_WARN_SECONDS` | no | `3600` | Age past which a stale serve is logged at error rather than warn. |
 | `KOMODO_INFISICAL_TIMEOUT_SECONDS` | no | `15` | HTTP timeout. |
