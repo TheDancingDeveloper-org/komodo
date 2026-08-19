@@ -29,6 +29,7 @@ Crucially, this does **not** make Komodo depend on Infisical being up. The last 
 | [`DESIGN.md`](DESIGN.md) | How the integration works, and the failure-mode decisions that shaped it |
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Building the one image that is needed, and rolling it out via a canary |
 | [`MAINTENANCE.md`](MAINTENANCE.md) | Staying at parity with upstream releases |
+| [`CANARY-2026-08-19.md`](CANARY-2026-08-19.md) | What the canary rollout proved, and the two defects it caught |
 | [`CADASTRE.md`](CADASTRE.md) | Estate records this work invalidates or adds |
 
 ## Shape of the change
@@ -72,8 +73,9 @@ mydevenv2-agent-auth run -- python3 scripts/tdd/audit-komodo-secrets.py   # re-r
 | Provider crate, guard, Core hook | Done — builds and tests pass on v2.2.0 and v2.3.2 |
 | Last-known-good persistence (survives a Core restart) | Done — proven by `tests/cold_start.rs` |
 | Snapshot encrypted at rest (AES-256-GCM) | Done — no secret value or name is readable on disk |
-| Core image (`linux/amd64`) | Built — `komodo-core-infisical:2.2.0-infisical.3` |
-| Deployed to Node B | **Not yet** — canary rollout is a human go/no-go, see [`DEPLOYMENT.md`](DEPLOYMENT.md) |
-| Dedicated Infisical identity for Komodo | **Not yet** — needs Infisical org admin, cannot be done by an agent |
-| Migrating the 180 literals | **Not started** — deliberately out of scope for this build |
-| Cadastre records updated | **Not yet** — do it after the canary, see [`CADASTRE.md`](CADASTRE.md) |
+| Core image (`linux/amd64`) | Built — `komodo-core-infisical:2.2.0-infisical.5` |
+| Deployed to Node B | **Live** — all 8 canary checks passed, see [`CANARY-2026-08-19.md`](CANARY-2026-08-19.md) |
+| Dedicated Infisical identity for Komodo | Done — `komodo-core`, read-only, write verified refused |
+| Stacks converted to references | **1 of 74** (`personal-egressd-speedtest`) |
+| Migrating the remaining 73 | **Not started** — deliberately out of scope |
+| Cadastre records updated | Done — `service:komodo` note corrected |
