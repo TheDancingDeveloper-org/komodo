@@ -20,23 +20,27 @@ fn cache_path() -> PathBuf {
   path
 }
 
-/// A snapshot as `persist::save` would have written it during a healthy
-/// refresh, before Infisical went away.
+const CLIENT_SECRET: &str = "st.cold-start.test-secret";
+
+/// Write a snapshot exactly as a healthy refresh would have, before Infisical
+/// went away -- through the crate's own encrypted writer, so this test also
+/// covers the real on-disk format rather than a hand-rolled stand-in.
 fn write_snapshot(path: &PathBuf) {
-  fs::create_dir_all(path.parent().unwrap()).unwrap();
-  fs::write(
-    path,
-    br#"{
-      "version": 1,
-      "fetched_at_unix": 1,
-      "scopes": ["apps/prod"],
-      "secrets": {
-        "infisical://apps/prod/DB_PASSWORD": "last-known-good",
-        "infisical://apps/prod/API_TOKEN": "also-known-good"
-      }
-    }"#,
-  )
-  .unwrap();
+  let mut secrets = HashMap::new();
+  secrets.insert(
+    "infisical://apps/prod/DB_PASSWORD".to_string(),
+    "last-known-good".to_string(),
+  );
+  secrets.insert(
+    "infisical://apps/prod/API_TOKEN".to_string(),
+    "also-known-good".to_string(),
+  );
+  let snapshot = infisical::persist::snapshot_from(
+    &secrets,
+    vec!["apps/prod".to_string()],
+  );
+  infisical::persist::save(path, &snapshot, CLIENT_SECRET)
+    .expect("seed snapshot");
 }
 
 #[tokio::test]
@@ -52,8 +56,14 @@ async fn cold_starts_from_disk_when_infisical_is_unreachable() {
     // Port 1 is closed, so this fails fast and deterministically -- it stands
     // in for "Infisical is down".
     std::env::set_var("KOMODO_INFISICAL_URL", "http://127.0.0.1:1");
-    std::env::set_var("KOMODO_INFISICAL_CLIENT_ID", "unused");
-    std::env::set_var("KOMODO_INFISICAL_CLIENT_SECRET", "unused");
+    std::env::set_var(
+      "KOMODO_INFISICAL_CLIENT_ID",
+      "unused-for-this-test",
+    );
+    std::env::set_var(
+      "KOMODO_INFISICAL_CLIENT_SECRET",
+      CLIENT_SECRET,
+    );
     std::env::set_var(
       "KOMODO_INFISICAL_PROJECTS",
       "apps=some-project-id",

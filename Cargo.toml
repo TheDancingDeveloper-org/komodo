@@ -139,5 +139,13 @@ colored = "3.1.1"
 bytes = "1.12.1"
 regex = "1.13.1"
 
+# FORK (TheDancingDeveloper) -- kept in a block of its own, deliberately.
+# Upstream bumps versions throughout the lists above on nearly every release,
+# and lines adjacent to those bumps conflict on every rebase. Isolating our
+# additions here keeps `scripts/tdd/sync-upstream.sh` conflict-free. Both
+# crates are already in the tree via rustls, so this pins nothing new.
+aws-lc-rs = "1.16.3"
+zeroize = "1.8.2"
+
 [profile.release]
 strip = "debuginfo"

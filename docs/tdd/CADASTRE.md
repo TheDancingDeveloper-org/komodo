@@ -38,7 +38,7 @@ Komodo consumes a new credential: its own Infisical machine identity.
 - `komodo consumes_secret homelab-komodo-infisical-client-id`
 - `komodo consumes_secret homelab-komodo-infisical-client-secret`
 
-Worth noting for anyone assessing exposure on `node-b`: with persistence enabled, Komodo Core also holds a plaintext copy of every secret it is scoped to, in a `0600` file on a private volume. That is a deliberate trade-off for availability, documented in `DESIGN.md`, and is the same trust level as the secret Variables Komodo already stores unencrypted in MongoDB.
+Worth noting for anyone assessing exposure on `node-b`: with persistence enabled, Komodo Core also holds a cached copy of every secret it is scoped to. That copy is **encrypted at rest** (AES-256-GCM, key derived from the Infisical client secret) in a `0600` file on a private volume, so the file is inert in a backup or disk image. It is decryptable only by a process already holding the client secret — which could read the same values from Infisical directly anyway — so it grants no new capability. See `DESIGN.md` for the precise threat model.
 
 Both live in Infisical `apps/prod`. Per [`DEPLOYMENT.md`](DEPLOYMENT.md) this must be a **dedicated read-only identity**, not the `mydevenv2-agents` identity, which holds read/write admin on `apps` and `cicd`.
 
