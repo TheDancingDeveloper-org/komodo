@@ -32,6 +32,8 @@ Tags published:
 
 Pin the **sha tag** in `/home/sprooty/stacks/komodo/docker-compose.yml`. The moving tag is for convenience, not for production.
 
+The `image` job is serialised across **all** refs via its own concurrency group. The workflow-level group is ref-scoped, so a push to `tdd/patches` and one to `tdd/release/*` once started two full Rust release builds on the same node-b daemon simultaneously and one died with a buildx transport error. Builds queue instead of racing, and a queued build is not cancelled.
+
 Three deliberate choices:
 
 - **`cargo fmt` is scoped to `-p infisical -p interpolate`.** `--all` would gate our CI on upstream's formatting, which we do not control and must not fight.
