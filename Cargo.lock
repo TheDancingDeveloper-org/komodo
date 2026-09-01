@@ -3212,12 +3212,12 @@ dependencies = [
 
 [[package]]
 name = "infisical"
-version = "2.2.0"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
  "data-encoding",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",
