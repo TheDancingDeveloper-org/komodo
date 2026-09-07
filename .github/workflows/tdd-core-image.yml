@@ -31,7 +31,7 @@ jobs:
   test:
     # Pure Rust, no node-b dependency -- so it may use any rust runner in the
     # pool rather than contending with the publish jobs for node-b.
-    runs-on: [self-hosted, linux, x64, rust]
+    runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v7
 
@@ -64,7 +64,7 @@ jobs:
 
   image:
     needs: test
-    runs-on: [self-hosted, node-b, linux, x64, publish, docker]
+    runs-on: [self-hosted, docker, publish]
     # Serialised across ALL refs, not just this one. The workflow-level group is
     # ref-scoped, so pushing tdd/patches and tdd/release/* together started two
     # full Rust release builds on the same node-b daemon at once and one died
