@@ -25,13 +25,15 @@ A merge-based fork accumulates merge commits and makes "what exactly did we chan
 git log --oneline v2.2.0..tdd/patches
 ```
 
-Three commits. That is the whole fork.
+Twenty-one commits at the time of writing (the integration, its tests, the fork
+docs, and the CI that keeps this parity going). That is the whole fork, and the
+command above always shows exactly what we changed and nothing else.
 
 ## The design rules that keep rebasing cheap
 
 These are not style preferences — they are the reason the series applied to v2.3.2 with zero conflicts.
 
-1. **Additive only.** The patch series deletes nothing from upstream files. Current diff: 6 files, 224 insertions, **0 deletions**.
+1. **Additive only.** The patch series **deletes nothing from any upstream file** — every upstream file it touches, it only adds to (currently ~30 files, roughly 3,900 insertions). The only removals anywhere in the series are within our own CI workflows and docs.
 2. **New code lives in a new crate.** `lib/infisical/` is ours alone and can never conflict.
 3. **Never touch the config structs.** Provider configuration is read from the process environment rather than `CoreConfig`. This deliberately avoids `client/core/rs/src/entities/config/core.rs`, `bin/core/src/config.rs` and `config/core.config.toml`, the three highest-churn config files upstream. Resisting the "but it belongs in CoreConfig" instinct is what keeps this fork maintainable.
 4. **One hook, not many.** The integration attaches at a single function (`get_variables_and_secrets`) that already backs all 12 interpolation call sites.
@@ -63,7 +65,7 @@ git push origin tdd/release/v2.4.0
 
 ## When a rebase conflicts
 
-A conflict means upstream changed something the patch series touches. There are only four such places, so diagnosis is quick:
+A conflict means upstream changed something the patch series touches. There are only a few such places, so diagnosis is quick:
 
 | Conflict in | Likely cause | Fix |
 |---|---|---|
@@ -71,6 +73,7 @@ A conflict means upstream changed something the patch series touches. There are 
 | `bin/core/src/main.rs` | startup sequence reordered | Re-place the `preload()` call after `startup::on_startup()` |
 | `lib/interpolate/src/lib.rs` | interpolation rewritten | Re-attach the guard immediately **before** the secrets pass; re-check `svi`'s escape rule still matches `unresolved_provider_token` |
 | `Cargo.toml` / `bin/core/Cargo.toml` | upstream bumped a dependency version next to ours | Keep **upstream's** versions, re-add our lines. If ours were not already in the trailing `# FORK` block, move them there so it stops recurring |
+| `Cargo.lock` | upstream bumped a dependency on the same line our `infisical` entry sits beside (the common case — happened on v2.3.3) | The lockfile is generated, so don't hand-tune it: resolve the marker by keeping **upstream's** version and re-adding our line, then run `cargo fetch` to make the whole file consistent again and commit it. The Upstream parity workflow does this refresh automatically after a clean rebase |
 
 After resolving, **always** re-run `cargo test -p interpolate`. The escape-handling tests are the ones that catch a silently broken guard, which is the dangerous failure mode: a broken guard does not error, it lets a literal token through into a deployment.
 
@@ -80,6 +83,7 @@ After resolving, **always** re-run `cargo test -p interpolate`. The escape-handl
 |---|---|---|---|
 | 2026-08-18 | `v2.2.0` | `v2.3.2` | Zero conflicts. One fix needed: upstream removed `workspace.package.authors`, so the crate manifest stopped inheriting it. |
 | 2026-08-19 | `v2.2.0` | `v2.3.2` | One conflict, in `Cargo.toml`: our `aws-lc-rs`/`zeroize` lines sat beside `rustls`, `uuid` and `data-encoding`, all of which upstream bumped. Resolved by keeping upstream's versions and re-adding ours — then fixed properly by moving both into the trailing `# FORK` block so it cannot recur. Builds and passes all 30 tests on both tags. |
+| 2026-09-10 | `v2.2.0` | `v2.3.3` | One conflict, in `Cargo.lock` only — `Cargo.toml` auto-merged cleanly, so the `# FORK` block held. Upstream bumped `indexmap` 2.14.0 → 2.14.1 on the line our `infisical` entry sits beside; resolved by keeping 2.14.1 and re-adding `infisical`, then regenerating the lockfile with `cargo fetch` (which also picked up `reqwest` 0.13.3 → 0.13.4 and upstream dropping `urlencoding`/`formatting`). `cargo fmt`, `cargo test -p interpolate -p infisical` (8 guard tests), and `cargo check` on Core + Periphery all pass. Branch `tdd/rebase/v2.3.3` ready to promote. |
 
 ## Contributing upstream
 
