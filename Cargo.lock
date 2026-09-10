@@ -2254,7 +2254,6 @@ dependencies = [
  "komodo_client",
  "mogh_cache",
  "tokio",
- "urlencoding",
 ]
 
 [[package]]
@@ -2878,12 +2877,12 @@ dependencies = [
 
 [[package]]
 name = "infisical"
-version = "2.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
  "data-encoding",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",
@@ -2915,7 +2914,6 @@ name = "interpolate"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "formatting",
  "komodo_client",
  "svi",
 ]
