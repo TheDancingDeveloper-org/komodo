@@ -204,6 +204,7 @@ jobs:
           echo "Reported: $title"
 
       - name: Report a conflict or a failed verification
+        id: report
         if: steps.check.outputs.uptodate == 'false' && (steps.rebase.outcome == 'failure' || steps.lockfile.outcome == 'failure' || steps.verify.outcome == 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -235,6 +236,11 @@ jobs:
           esac
           if [ "$total" != "0" ]; then
             echo "Issue already open"
+            # The break is already tracked in an open issue, which is the standing
+            # signal. Don't re-fail the scheduled run every day on top of it -- that
+            # only adds red noise the maintainer learns to ignore. The run goes green
+            # and the open issue carries the alert until a human clears it.
+            echo "newly_opened=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -267,9 +273,15 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "$API/repos/$REPO/issues" -d "$payload" > /dev/null
           echo "Opened issue: $title"
+          # First time this break is reported -- fail the run so it is noticed.
+          echo "newly_opened=true" >> "$GITHUB_OUTPUT"
 
-      - name: Fail the run if parity is broken
-        if: steps.check.outputs.uptodate == 'false' && (steps.rebase.outcome == 'failure' || steps.lockfile.outcome == 'failure' || steps.verify.outcome == 'failure')
+      - name: Fail the run only when a new parity break was reported
+        # A break already tracked in an open issue leaves the run green -- the issue
+        # is the standing signal. Only a newly opened issue (a break not seen on the
+        # previous run) reds the run, so the maintainer notices it once rather than
+        # every day until they get round to it.
+        if: steps.report.outputs.newly_opened == 'true'
         run: exit 1
 
       - name: Summary
