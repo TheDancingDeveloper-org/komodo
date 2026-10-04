@@ -3537,6 +3537,7 @@ dependencies = [
  "mogh_secret_file",
  "mogh_server",
  "mogh_validations",
+ "names_diff",
  "partial_derive2",
  "periphery_client",
  "regex",
@@ -4150,6 +4151,16 @@ dependencies = [
  "serde",
  "serde_derive",
  "urlencoding",
+]
+
+[[package]]
+name = "names_diff"
+version = "2.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "toml",
 ]
 
 [[package]]

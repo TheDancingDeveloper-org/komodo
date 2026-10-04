@@ -214,6 +214,13 @@ impl Resolve<WriteArgs> for WriteStackFileContents {
       make_update(&stack, Operation::WriteStackContents, user);
 
     update.push_simple_log("File contents to write", &contents);
+    // FORK (WI-865): content-free summary of the change.
+    crate::tdd::push_file_change(
+      &mut update,
+      &stack,
+      &file_path,
+      &contents,
+    );
 
     let id = stack.id.clone();
 

@@ -46,6 +46,7 @@ pub fn make_update(
 pub async fn add_update(
   mut update: Update,
 ) -> anyhow::Result<String> {
+  crate::tdd::stamp(&mut update); // FORK (WI-865)
   update.id = db_client()
     .updates
     .insert_one(&update)
@@ -77,6 +78,10 @@ pub async fn add_update_without_send(
 }
 
 pub async fn update_update(update: Update) -> anyhow::Result<()> {
+  // FORK (WI-865): re-stamp, idempotently, in case the caller's in-memory
+  // copy predates the stamp that add_update put on the stored one.
+  let mut update = update;
+  crate::tdd::stamp(&mut update);
   update_one_by_id(&db_client().updates, &update.id, database::mungos::update::Update::Set(to_document(&update)?), None)
     .await
     .context("failed to update the update on db. the update build process was deleted")?;
@@ -271,6 +276,7 @@ pub async fn init_execution_update(
 
   let mut update = make_update(target, operation, user);
   update.in_progress();
+  crate::tdd::stamp(&mut update); // FORK (WI-865)
 
   // Hold off on even adding update for DeployStackIfChanged
   if !matches!(&request, ExecuteRequest::DeployStackIfChanged(_)) {

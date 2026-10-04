@@ -226,6 +226,8 @@ pub fn router() -> Router {
     .layer(middleware::from_fn(
       authenticate_request::<KomodoAuthImpl, true>,
     ))
+    // FORK: X-Komodo-Actor/-Reason attribution (WI-865).
+    .layer(middleware::from_fn(crate::tdd::scope_layer))
 }
 
 async fn variant_handler(
@@ -244,7 +246,8 @@ async fn handler(
   Extension(user): Extension<User>,
   Json(request): Json<WriteRequest>,
 ) -> mogh_error::Result<axum::response::Response> {
-  let res = tokio::spawn(task(request, user))
+  // FORK: `propagate` carries the asserted actor into the spawned task.
+  let res = tokio::spawn(crate::tdd::propagate(task(request, user)))
     .await
     .context("failure in spawned task");
 

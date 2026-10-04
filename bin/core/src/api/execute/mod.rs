@@ -173,6 +173,8 @@ pub fn router() -> Router {
     .layer(middleware::from_fn(
       authenticate_request::<KomodoAuthImpl, true>,
     ))
+    // FORK: X-Komodo-Actor/-Reason attribution (WI-865).
+    .layer(middleware::from_fn(crate::tdd::scope_layer))
 }
 
 async fn variant_handler(
