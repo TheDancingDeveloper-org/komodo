@@ -45,10 +45,10 @@ jobs:
       # Scoped to the crates this fork owns or changes. `--all` would gate our
       # CI on upstream's formatting, which we do not control and must not fight.
       - name: Formatting (fork-owned crates)
-        run: cargo fmt -p infisical -p interpolate --check
+        run: cargo fmt -p infisical -p interpolate -p names_diff -p komodo_mcp --check
 
       - name: Unit and integration tests
-        run: cargo test -p infisical -p interpolate --locked
+        run: cargo test -p infisical -p interpolate -p names_diff -p komodo_mcp --locked
 
       # The guard is the safety-critical part: if it stops failing closed, a
       # failed secret lookup would deploy a literal token as a password.
@@ -61,6 +61,10 @@ jobs:
       # the hook before we spend ten minutes compiling.
       - name: Both binaries still build
         run: cargo check -p komodo_core -p komodo_periphery --locked
+
+      # Attribution + names-only change records hooked into Core (WI-865).
+      - name: Core fork hooks
+        run: cargo test -p komodo_core --locked tdd::
 
   image:
     needs: test

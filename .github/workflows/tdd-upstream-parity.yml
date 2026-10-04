@@ -126,8 +126,8 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          cargo fmt -p infisical -p interpolate --check
-          cargo test -p infisical -p interpolate
+          cargo fmt -p infisical -p interpolate -p names_diff -p komodo_mcp --check
+          cargo test -p infisical -p interpolate -p names_diff -p komodo_mcp
           cargo check -p komodo_core -p komodo_periphery
 
       - name: Publish the rebased branch and report it is ready

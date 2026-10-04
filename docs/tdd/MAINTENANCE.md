@@ -75,6 +75,18 @@ A conflict means upstream changed something the patch series touches. There are 
 | `Cargo.toml` / `bin/core/Cargo.toml` | upstream bumped a dependency version next to ours | Keep **upstream's** versions, re-add our lines. If ours were not already in the trailing `# FORK` block, move them there so it stops recurring |
 | `Cargo.lock` | upstream bumped a dependency on the same line our `infisical` entry sits beside (the common case — happened on v2.3.3) | The lockfile is generated, so don't hand-tune it: resolve the marker by keeping **upstream's** version and re-adding our line, then run `cargo fetch` to make the whole file consistent again and commit it. The Upstream parity workflow does this refresh automatically after a clean rebase |
 
+The attribution hooks (WI-865) are one or two lines each, all marked `FORK (WI-865)`:
+
+| Conflict in | Fix |
+|---|---|
+| `bin/core/src/api/write/mod.rs` | Keep `crate::tdd::propagate(...)` around the spawned write `task`, and the `tdd::scope_layer` layer on the router |
+| `bin/core/src/api/execute/mod.rs` | Keep the `tdd::scope_layer` layer on the router |
+| `bin/core/src/helpers/update.rs` | Re-add `crate::tdd::stamp(&mut update)` in `add_update`, `update_update` and after `update.in_progress()` in `init_execution_update` |
+| `bin/core/src/resource/mod.rs` | Re-add `crate::tdd::push_config_diff(&mut update)` after `prev_toml`/`current_toml` are set in `update()` |
+| `bin/core/src/api/write/stack.rs` | Re-add `crate::tdd::push_file_change(...)` after the "File contents to write" log |
+
+Then run `cargo test -p komodo_core tdd::` and `cargo test -p komodo_mcp`. The latter includes `every_stack_field_is_classified`, which fails when upstream adds a Stack field: classify the new field in `bin/mcp/src/redact.rs`. An unclassified field is withheld rather than leaked, so the failure is a prompt to decide, not a leak.
+
 After resolving, **always** re-run `cargo test -p interpolate`. The escape-handling tests are the ones that catch a silently broken guard, which is the dangerous failure mode: a broken guard does not error, it lets a literal token through into a deployment.
 
 ## Rebase history
