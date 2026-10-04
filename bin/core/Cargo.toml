@@ -20,6 +20,8 @@ periphery_client.workspace = true
 mogh_validations.workspace = true
 interpolate.workspace = true
 infisical.workspace = true
+# FORK: names-only change records (WI-865). Path dep, so no root Cargo.toml line.
+names_diff = { path = "../../lib/names_diff" }
 mogh_secret_file.workspace = true
 formatting.workspace = true
 mogh_rate_limit.workspace = true

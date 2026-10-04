@@ -26,6 +26,8 @@ mod startup;
 mod state;
 mod sync;
 mod ts_client;
+// FORK: attribution + names-only diffs on Updates (WI-865).
+mod tdd;
 
 async fn app() -> anyhow::Result<()> {
   dotenvy::dotenv().ok();

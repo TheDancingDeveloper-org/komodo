@@ -637,6 +637,10 @@ pub async fn update<T: KomodoResource>(
       .push_simple_log("Failed export", format_serror(&e.into())),
   }
 
+  // FORK (WI-865): names-only diff, so the change is readable without
+  // the secret-bearing prev_toml/current_toml.
+  crate::tdd::push_config_diff(&mut update);
+
   let updated = get::<T>(id_or_name).await?;
 
   T::post_update(&updated, &mut update).await?;
