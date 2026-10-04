@@ -64,7 +64,7 @@ jobs:
 
       # Attribution + names-only change records hooked into Core (WI-865).
       - name: Core fork hooks
-        run: cargo test -p komodo_core --locked tdd::
+        run: "cargo test -p komodo_core --locked tdd::"
 
   image:
     needs: test
