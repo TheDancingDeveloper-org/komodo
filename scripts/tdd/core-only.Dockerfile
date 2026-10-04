@@ -29,12 +29,15 @@ COPY ./client/periphery ./client/periphery
 COPY ./bin/core ./bin/core
 COPY ./bin/periphery ./bin/periphery
 COPY ./bin/cli ./bin/cli
+COPY ./bin/mcp ./bin/mcp
 COPY ./xtask ./xtask
 
 # `km` is shipped in the upstream Core image and referenced by the
 # KOMODO_CLI_CONFIG_* environment below, so it is built to keep this image's
 # contract identical to upstream's. komodo_periphery is deliberately absent.
-RUN cargo build -p komodo_core -p komodo_cli --release && cargo strip
+# `komodo-mcp` (fork-only, bin/mcp) ships alongside so agents can run it from
+# the image; it is a client of Core's API and is never started by Core.
+RUN cargo build -p komodo_core -p komodo_cli -p komodo_mcp --release && cargo strip
 
 FROM ${UI_IMAGE} AS ui
 
@@ -48,6 +51,7 @@ COPY ./config/core.config.toml /config/.default.config.toml
 COPY --from=ui /ui /app/ui
 COPY --from=builder /builder/target/release/core /usr/local/bin/core
 COPY --from=builder /builder/target/release/km /usr/local/bin/km
+COPY --from=builder /builder/target/release/komodo-mcp /usr/local/bin/komodo-mcp
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 ENV DENO_DIR=/action-cache/deno

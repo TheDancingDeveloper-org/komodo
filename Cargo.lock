@@ -3567,6 +3567,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "komodo_mcp"
+version = "2.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bson",
+ "chrono",
+ "komodo_client",
+ "mogh_resolver",
+ "names_diff",
+ "regex",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "komodo_periphery"
 version = "2.2.0"
 dependencies = [
