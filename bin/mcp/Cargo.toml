@@ -1,0 +1,31 @@
+[package]
+name = "komodo_mcp"
+description = "MCP server for Komodo with server-side redaction and a per-stack execute allowlist (fork-only, TheDancingDeveloper)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "komodo-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Fork-local crates are referenced by path rather than through
+# `[workspace.dependencies]`, so this crate adds nothing to the root
+# Cargo.toml and cannot conflict on an upstream rebase.
+names_diff = { path = "../../lib/names_diff" }
+komodo_client.workspace = true
+anyhow.workspace = true
+bson.workspace = true
+chrono.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+mogh_resolver.workspace = true
+serde.workspace = true

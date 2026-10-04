@@ -33,6 +33,14 @@ Crucially, this does **not** make Komodo depend on Infisical being up. The last 
 | [`CICD.md`](CICD.md) | The build/publish pipeline and the automated upstream-parity watcher |
 | [`CUTOVER.md`](CUTOVER.md) | Converting the remaining 73 stacks |
 | [`CADASTRE.md`](CADASTRE.md) | Estate records this work invalidates or adds |
+| [`../../bin/mcp/README.md`](../../bin/mcp/README.md) | `komodo-mcp`: typed MCP tools for agents, with server-side redaction and a per-stack mutation allowlist (WI-846) |
+
+## Second capability: agent tooling and change attribution
+
+Two more fork-only additions, both self-contained:
+
+- **`bin/mcp` (`komodo-mcp`)**: an MCP server built on the typed client. It replaces raw `curl` against the API, never returns `.config.environment` values, and gates writes and deploys per stack. Prod requires an exact opt-in.
+- **`lib/names_diff` + `bin/core/src/tdd`**: Core now records two extra logs on Updates. One is a **names-only diff** of every resource config change, with env keys added, removed or changed and values shown as fingerprints. The other is the **asserted actor and reason** from `X-Komodo-Actor`/`X-Komodo-Reason`. Seeing what changed in a stack's env therefore no longer means reading `prev_toml`, which holds every secret (WI-865).
 
 ## Shape of the change
 
