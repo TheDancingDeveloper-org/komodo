@@ -1545,22 +1545,46 @@ fn rendered_command_assignment(
 /// Like-for-like check against Core's export. toml_pretty writes command
 /// objects as dotted keys (`pre_deploy.path = …`) under `[stack.config]`,
 /// and its multiline strings are not valid TOML, so this never parses.
+/// Both sides use the same extractor, so an omitted empty `path` or a
+/// multiline command's continuation lines cannot cause a false race.
 fn command_matches_prev(
   rendered: &str,
   which: &str,
   expected: Option<&str>,
 ) -> bool {
+  let actual = command_block(rendered, which);
   match expected {
-    None => {
-      let prefix = format!("{which}.");
-      !rendered.lines().any(|line| line.starts_with(&prefix))
-    }
-    Some(expected) => {
-      let expected = expected.trim_end_matches('\n');
-      rendered.starts_with(expected)
-        || rendered.contains(&format!("\n{expected}"))
+    None => actual.is_none(),
+    Some(expected) => actual == command_block(expected, which),
+  }
+}
+
+/// The contiguous `which.*` assignment block. A multiline string opens on
+/// its assignment line and closes on a later line, so continuation lines
+/// stay in the block until the next dotted key.
+fn command_block(rendered: &str, which: &str) -> Option<String> {
+  let prefix = format!("{which}.");
+  let mut lines = Vec::new();
+  let mut seen = false;
+  let mut continued = false;
+  for line in rendered.lines() {
+    let quotes = line.matches("\"\"\"").count();
+    if line.starts_with(&prefix) {
+      seen = true;
+      lines.push(line);
+      if quotes % 2 == 1 {
+        continued = !continued;
+      }
+    } else if seen && continued {
+      lines.push(line);
+      if quotes % 2 == 1 {
+        continued = false;
+      }
+    } else if seen {
+      break;
     }
   }
+  seen.then(|| lines.join("\n"))
 }
 
 fn chrono_now_ms() -> i64 {

@@ -639,8 +639,7 @@ async fn handle(
           .unwrap_or_else(|| before.pre_deploy.clone());
         stored.pre_deploy =
           m.command_store_instead.take().unwrap_or(sent);
-      }
-      if let Some(sent) = p.config.post_deploy {
+      } else if let Some(sent) = p.config.post_deploy {
         previous.post_deploy = m
           .command_race_prev
           .take()
@@ -2098,9 +2097,28 @@ async fn edit_command_protected_stack_still_refused() {
 }
 
 #[tokio::test]
+async fn edit_command_empty_path_is_not_a_false_race() {
+  for old in ["echo stored\n", "sed 's/\\./x/'\n"] {
+    let (server, state) = start(policy("vogt-dev", "")).await;
+    set_dev_command(
+      &state,
+      SystemCommand {
+        path: String::new(),
+        command: old.into(),
+        shell_mode: false,
+      },
+    );
+    let response = call_command(&server, json!({})).await;
+    assert_eq!(response["isError"], false, "{old}: {response}");
+    assert_eq!(dev_command(&state).path, "");
+    assert_eq!(update_stack_count(&state), 1);
+  }
+}
+
+#[tokio::test]
 async fn edit_command_backslashes_are_not_a_false_race_or_leak() {
   let (server, state) = start(policy("vogt-dev", "")).await;
-  let old = "sed 's/\\./x/'\necho continue && \\\n+  echo done\n";
+  let old = "sed 's/\\./x/'\necho continue && \\\n  echo done\n";
   set_dev_command(
     &state,
     SystemCommand {
@@ -2120,7 +2138,7 @@ async fn edit_command_detects_race_and_verification_mismatch() {
   let (server, state) = start(policy("vogt-dev", "")).await;
   let current = SystemCommand {
     path: "sh".into(),
-    command: "echo old && \\\n+  echo continued\nsed 's/\\./x/'\n"
+    command: "echo old && \\\n  echo continued\nsed 's/\\./x/'\n"
       .into(),
     shell_mode: false,
   };
