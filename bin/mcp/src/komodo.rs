@@ -129,22 +129,19 @@ impl Komodo {
       .map(|_| ())
   }
 
-  /// `UpdateStack` with only `environment` set. Other config fields stay
-  /// `None` and are omitted (`skip_serializing_none` on `_PartialStackConfig`).
+  /// `UpdateStack` with only the supplied partial fields set. Other config
+  /// fields stay `None` and are omitted by `_PartialStackConfig`.
   pub async fn update_stack_partial(
     &self,
     id: &str,
-    environment: String,
+    config: _PartialStackConfig,
     reason: Option<&str>,
   ) -> anyhow::Result<Stack> {
     self
       .stamped(reason)
       .write(UpdateStack {
         id: id.to_string(),
-        config: _PartialStackConfig {
-          environment: Some(environment),
-          ..Default::default()
-        },
+        config,
       })
       .await
   }
@@ -342,6 +339,29 @@ mod tests {
     let config = v["params"]["config"].as_object().unwrap();
     assert_eq!(config.keys().collect::<Vec<_>>(), ["environment"]);
     assert!(v["params"].get("stack").is_none());
+    let v = envelope(UpdateStack {
+      id: "s".into(),
+      config: _PartialStackConfig {
+        pre_deploy: Some(komodo_client::entities::SystemCommand {
+          path: "sh".into(),
+          command: "echo ok".into(),
+          shell_mode: true,
+        }),
+        ..Default::default()
+      },
+    });
+    assert_eq!(
+      v,
+      json!({
+        "type": "UpdateStack",
+        "params": {
+          "id": "s",
+          "config": { "pre_deploy": {
+            "path": "sh", "command": "echo ok", "shell_mode": true
+          }}
+        }
+      })
+    );
     // GetStack also accepts `id`/`name` aliases on the server side.
     let parsed: GetStack =
       serde_json::from_value(json!({"name": "vogt-dev"})).unwrap();

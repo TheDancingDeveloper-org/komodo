@@ -124,6 +124,7 @@ pub fn instructions(policy: &Policy) -> String {
      Secrets are redacted server-side: env is names + fingerprints only. {mode} \
      Typical deploy: stack_lookup -> read_stack_file -> write_stack_file -> deploy_stack -> container_health. \
      Change one env key with edit_stack_env (an [[infisical://alias/env/KEY]] reference only; never a literal). \
+     Append or replace pre_deploy/post_deploy with edit_stack_command; replace requires the current fingerprint and literal secrets are refused. \
      To answer 'what changed and who': stack_history(since_last_successful_deploy=true) or env_diff(against={{last_successful_deploy:true}})."
   )
 }

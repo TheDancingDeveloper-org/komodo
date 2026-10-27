@@ -362,6 +362,12 @@ impl Scrubber {
     out
   }
 
+  /// Whether text contains a learned secret value or a known token shape.
+  /// Used to reject command literals before they can be persisted.
+  pub fn contains_secret(&self, s: &str) -> bool {
+    self.scrub_str(s) != s
+  }
+
   pub fn scrub(&self, v: &mut Value) {
     match v {
       Value::String(s) => *s = self.scrub_str(s),

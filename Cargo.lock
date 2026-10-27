@@ -3231,6 +3231,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "toml_pretty",
 ]
 

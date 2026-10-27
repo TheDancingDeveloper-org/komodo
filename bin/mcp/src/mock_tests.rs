@@ -23,7 +23,8 @@ use komodo_client::{
     write::{RefreshStackCache, WriteStackFileContents},
   },
   entities::{
-    Operation, ResourceTarget, ResourceTargetVariant, Version,
+    Operation, ResourceTarget, ResourceTargetVariant, SystemCommand,
+    Version,
     docker::{
       ContainerConfig,
       container::{
@@ -88,9 +89,11 @@ struct Mock {
   /// Next UpdateStack writes the stored env as this string instead of the
   /// body that was sent. Consumed once. Used to fail verification.
   store_instead: Option<String>,
+  command_store_instead: Option<SystemCommand>,
   /// Next UpdateStack reports this env as prev_toml (a lost update).
   /// Consumed once.
   race_prev: Option<String>,
+  command_race_prev: Option<SystemCommand>,
   /// Every UpdateStack reports this env as prev_toml. Not consumed, so a
   /// repair write races too.
   race_prev_always: Option<String>,
@@ -348,10 +351,8 @@ fn matches_query(u: &UpdateListItem, q: &bson::Document) -> bool {
   true
 }
 
-fn env_resource_toml(name: &str, env: &str) -> String {
-  // Same renderer as Core's Update export (toml_pretty 2.0.0, Core's
-  // options). A multiline env is `"""\n{bytes}"""` with no escaping.
-  crate::tools::export_env_resource_toml(name, env)
+fn stack_resource_toml(name: &str, config: &StackConfig) -> String {
+  crate::tools::export_stack_resource_toml(name, config)
 }
 
 async fn handle(
@@ -540,31 +541,49 @@ async fn handle(
     }
     ("write", "UpdateStack") => {
       let p = parse!(komodo_client::api::write::UpdateStack);
-      let sent = p.config.environment.clone().unwrap_or_default();
       let idx = m
         .stacks
         .iter()
         .position(|s| s.id == p.id || s.name == p.id)
         .ok_or_else(|| err("no stack"))?;
-      let before = m.stacks[idx].config.environment.clone();
-      let raced = if m.race_prev_always.is_some() {
-        m.race_prev_always.clone()
-      } else {
-        m.race_prev.take()
-      };
-      // Core stores the sent body exactly. prev_toml is the buffer that
-      // was overwritten: the raced buffer when a test sets one, else the
-      // env that was stored before this write. Raw values stay in this
-      // in-process mock only; they are never written to a log.
-      let prev = raced.clone().unwrap_or_else(|| before.clone());
-      let stored = m.store_instead.take().unwrap_or(sent.clone());
-      m.stacks[idx].config.environment = stored.clone();
+      let before = m.stacks[idx].config.clone();
+      let mut previous = before.clone();
+      let mut stored = before.clone();
+      if let Some(sent) = p.config.environment {
+        let raced = if m.race_prev_always.is_some() {
+          m.race_prev_always.clone()
+        } else {
+          m.race_prev.take()
+        };
+        previous.environment =
+          raced.unwrap_or_else(|| before.environment.clone());
+        stored.environment = m.store_instead.take().unwrap_or(sent);
+      }
+      if let Some(sent) = p.config.pre_deploy {
+        previous.pre_deploy = m
+          .command_race_prev
+          .take()
+          .unwrap_or_else(|| before.pre_deploy.clone());
+        stored.pre_deploy =
+          m.command_store_instead.take().unwrap_or(sent);
+      }
+      if let Some(sent) = p.config.post_deploy {
+        previous.post_deploy = m
+          .command_race_prev
+          .take()
+          .unwrap_or_else(|| before.post_deploy.clone());
+        stored.post_deploy =
+          m.command_store_instead.take().unwrap_or(sent);
+      }
+      // Core stores each sent partial field exactly. Raw command and env
+      // values remain only in this in-process mock and the Update TOML.
+      m.stacks[idx].config = stored.clone();
       m.update_seq += 1;
       let id = format!("cccccccccccccccccccc{:04x}", m.update_seq);
       let stack_id = m.stacks[idx].id.clone();
       let name = m.stacks[idx].name.clone();
-      let prev_toml = env_resource_toml(&name, &prev);
-      let current_toml = env_resource_toml(&name, &stored);
+      let prev_toml = stack_resource_toml(&name, &previous);
+      let current_toml = stack_resource_toml(&name, &stored);
       let diff =
         names_diff::diff_resource_toml(&prev_toml, &current_toml)
           .map(|d| d.render())
@@ -1072,7 +1091,7 @@ async fn errors_are_scrubbed_and_protocol_works() {
     .iter()
     .map(|t| t["name"].as_str().unwrap())
     .collect();
-  assert_eq!(names.len(), 10);
+  assert_eq!(names.len(), 11);
   assert!(server.handle(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await.is_none());
   let unknown = server
     .handle(json!({"jsonrpc": "2.0", "id": 3, "method": "x"}))
@@ -1168,6 +1187,52 @@ fn call_env(
     }
   }
   async move { server.call_tool("edit_stack_env", &args).await }
+}
+
+fn call_command(
+  server: &Server,
+  extra: serde_json::Value,
+) -> impl std::future::Future<Output = Value> + '_ {
+  let mut args = json!({
+    "stack": "vogt-dev",
+    "which": "pre_deploy",
+    "op": "append",
+    "command": "echo appended",
+    "reason": "edit test command",
+  });
+  if let (Some(obj), Some(more)) =
+    (args.as_object_mut(), extra.as_object())
+  {
+    for (key, value) in more {
+      obj.insert(key.clone(), value.clone());
+    }
+  }
+  async move { server.call_tool("edit_stack_command", &args).await }
+}
+
+fn set_dev_command(state: &Shared, command: SystemCommand) {
+  state
+    .lock()
+    .unwrap()
+    .stacks
+    .iter_mut()
+    .find(|stack| stack.name == "vogt-dev")
+    .unwrap()
+    .config
+    .pre_deploy = command;
+}
+
+fn dev_command(state: &Shared) -> SystemCommand {
+  state
+    .lock()
+    .unwrap()
+    .stacks
+    .iter()
+    .find(|stack| stack.name == "vogt-dev")
+    .unwrap()
+    .config
+    .pre_deploy
+    .clone()
 }
 
 /// Test 1: one key changes; every other byte and the rest of the config stay.
@@ -1606,4 +1671,173 @@ async fn edit_env_backslash_is_not_a_false_race() {
   assert!(stored.contains("RE=a\\.b\n"), "{stored}");
   assert!(stored.contains("TRAIL=end\\\n"), "{stored}");
   assert!(stored.contains(&format!("KEEP={REF}\n")), "{stored}");
+}
+
+/// Test 12: append keeps path and shell_mode, and never returns old text.
+#[tokio::test]
+async fn edit_command_append_keeps_metadata_without_old_text() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_command(
+    &state,
+    SystemCommand {
+      path: "/srv/vogt".into(),
+      command: "old command that must stay private\n".into(),
+      shell_mode: true,
+    },
+  );
+  let response = call_command(&server, json!({})).await;
+  assert_eq!(response["isError"], false, "{response}");
+  let body = text_of(&response);
+  assert_eq!(body["path"], "/srv/vogt");
+  assert_eq!(body["shell_mode"], true);
+  assert_eq!(body["diff"]["appended_lines"], 1);
+  assert_eq!(body["appended"], "echo appended");
+  let rendered = response.to_string();
+  assert!(!rendered.contains("old command"), "{rendered}");
+  assert_eq!(
+    dev_command(&state),
+    SystemCommand {
+      path: "/srv/vogt".into(),
+      command: "old command that must stay private\necho appended\n"
+        .into(),
+      shell_mode: true,
+    }
+  );
+}
+
+/// Test 13: replace requires the current command fingerprint.
+#[tokio::test]
+async fn edit_command_replace_requires_matching_fingerprint() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let current = SystemCommand {
+    path: "sh".into(),
+    command: "echo old\n".into(),
+    shell_mode: false,
+  };
+  set_dev_command(&state, current.clone());
+  let missing = call_command(
+    &server,
+    json!({"op": "replace", "command": "echo new"}),
+  )
+  .await;
+  assert_eq!(missing["isError"], true, "{missing}");
+  assert!(
+    text_of_err(&missing).contains("if_fingerprint is required")
+  );
+  let stale = call_command(
+    &server,
+    json!({
+      "op": "replace",
+      "command": "echo new",
+      "if_fingerprint": names_diff::fingerprint("other"),
+    }),
+  )
+  .await;
+  assert_eq!(stale["isError"], true, "{stale}");
+  assert!(text_of_err(&stale).contains("conflict"));
+  assert_eq!(dev_command(&state), current);
+  assert_eq!(update_stack_count(&state), 0);
+  let matching = call_command(
+    &server,
+    json!({
+      "op": "replace",
+      "command": "echo new",
+      "path": "/tmp",
+      "if_fingerprint": names_diff::fingerprint("echo old\n"),
+    }),
+  )
+  .await;
+  assert_eq!(matching["isError"], false, "{matching}");
+  assert_eq!(dev_command(&state).command, "echo new\n");
+  assert_eq!(dev_command(&state).path, "/tmp");
+
+  let cleared = call_command(
+    &server,
+    json!({
+      "op": "replace",
+      "command": "",
+      "if_fingerprint": names_diff::fingerprint("echo new\n"),
+    }),
+  )
+  .await;
+  assert_eq!(cleared["isError"], false, "{cleared}");
+  assert_eq!(dev_command(&state).command, "");
+}
+
+/// Test 14: known env values and token-shaped literals are refused silently.
+#[tokio::test]
+async fn edit_command_refuses_literal_secrets_without_echoing() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  for literal in [SECRET_DB, SECRET_GH] {
+    let response = call_command(
+      &server,
+      json!({"command": format!("echo {literal}")}),
+    )
+    .await;
+    assert_eq!(response["isError"], true, "{response}");
+    let text = response.to_string();
+    assert!(
+      text.contains("command contains a literal secret"),
+      "{text}"
+    );
+    assert!(!text.contains(literal), "{text}");
+  }
+  assert_eq!(update_stack_count(&state), 0);
+}
+
+#[tokio::test]
+async fn edit_command_detects_race_and_verification_mismatch() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let current = SystemCommand {
+    path: "sh".into(),
+    command: "echo old".into(),
+    shell_mode: false,
+  };
+  set_dev_command(&state, current.clone());
+  state.lock().unwrap().command_race_prev = Some(SystemCommand {
+    command: "echo raced".into(),
+    ..current.clone()
+  });
+  let raced = call_command(&server, json!({})).await;
+  assert_eq!(raced["isError"], true, "{raced}");
+  assert!(text_of_err(&raced).contains("concurrent writers"));
+
+  set_dev_command(&state, current.clone());
+  state.lock().unwrap().command_store_instead = Some(SystemCommand {
+    command: "echo wrong".into(),
+    ..current
+  });
+  let mismatch = call_command(&server, json!({})).await;
+  assert_eq!(mismatch["isError"], true, "{mismatch}");
+  assert!(text_of_err(&mismatch).contains("verification failed"));
+}
+
+/// Command half of test 17: append the four-line render step without deploy.
+#[tokio::test]
+async fn edit_command_appends_l3_render_step_without_deploy() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let old = "set -e\necho one\necho two";
+  set_dev_command(
+    &state,
+    SystemCommand {
+      path: "sh".into(),
+      command: format!("{old}\n"),
+      shell_mode: false,
+    },
+  );
+  let render = "umask 077\nSCCACHE_DIST_CLIENT_TOKEN=\"$(sed -n 's/^SCCACHE_DIST_CLIENT_TOKEN=//p' .env)\" && test -n \"$SCCACHE_DIST_CLIENT_TOKEN\" && \\\n  SCCACHE_DIST_CLIENT_TOKEN=\"$SCCACHE_DIST_CLIENT_TOKEN\" awk '{ gsub(/@SCCACHE_DIST_CLIENT_TOKEN@/, ENVIRON[\"SCCACHE_DIST_CLIENT_TOKEN\"]) } 1' sccache.conf.tmpl > sccache.conf\nchown 1000:1000 sccache.conf && chmod 600 sccache.conf";
+  let response =
+    call_command(&server, json!({"command": render})).await;
+  assert_eq!(response["isError"], false, "{response}");
+  assert_eq!(
+    dev_command(&state).command,
+    format!("{old}\n{render}\n")
+  );
+  assert!(types(&state).iter().all(|kind| kind != "DeployStack"));
+
+  let repeat =
+    call_command(&server, json!({"command": render})).await;
+  assert_eq!(repeat["isError"], false, "{repeat}");
+  assert_eq!(text_of(&repeat)["changed"], false);
+  assert_eq!(update_stack_count(&state), 1);
 }
