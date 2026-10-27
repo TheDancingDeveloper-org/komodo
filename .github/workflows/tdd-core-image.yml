@@ -64,6 +64,9 @@ jobs:
 
       # Attribution + names-only change records hooked into Core (WI-865).
       - name: Core fork hooks
+        # OOM on aws-sdk-ec2; operator exception 2026-10-27.
+        env:
+          CARGO_BUILD_JOBS: "4"
         run: "cargo test -p komodo_core --locked tdd::"
 
   image:
