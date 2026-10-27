@@ -17,10 +17,6 @@ ARG KOMODO_VERSION=2
 ARG UI_IMAGE=ghcr.io/moghtech/komodo-ui:${KOMODO_VERSION}
 
 FROM rust:1.95.0-bookworm AS builder
-# Empty by default so local and tdd/patches builds stay uncapped.
-# OOM on aws-sdk-ec2; operator exception 2026-10-27.
-ARG CARGO_BUILD_JOBS=
-ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN cargo install cargo-strip
 WORKDIR /builder
 
