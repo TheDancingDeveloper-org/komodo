@@ -13,9 +13,7 @@ use encoding::{
   WithChannel,
 };
 use komodo_client::entities::{
-  builder::UrlBuilderConfig,
-  optional_str,
-  server::Server,
+  builder::UrlBuilderConfig, optional_str, server::Server,
 };
 use mogh_cache::CloneCache;
 use mogh_error::serror_into_anyhow_error;

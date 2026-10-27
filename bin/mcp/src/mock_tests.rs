@@ -19,7 +19,10 @@ use axum::{
 use komodo_client::{
   api::{
     execute::DeployStack,
-    read::{GetStack, GetStackLog, GetUpdate, ListUpdates},
+    read::{
+      GetStack, GetStackLog, GetUpdate, GetUsername, GetVariable,
+      ListUpdates,
+    },
     write::{RefreshStackCache, WriteStackFileContents},
   },
   entities::{
@@ -39,6 +42,7 @@ use komodo_client::{
       StackState,
     },
     update::{Log, Update, UpdateListItem, UpdateStatus},
+    variable::Variable,
   },
 };
 use serde_json::{Value, json};
@@ -109,6 +113,8 @@ struct Mock {
   pending_write: Option<(String, String, String)>,
   deploy_fails: bool,
   get_update_calls: usize,
+  variables: HashMap<String, Variable>,
+  service_users: Vec<String>,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -297,6 +303,59 @@ fn new_mock() -> Shared {
   }))
 }
 
+fn install_unlock(
+  state: &Shared,
+  variable_stack: &str,
+  entry_stack: &str,
+  scopes: &[&str],
+  setter: &str,
+  offset_secs: i64,
+) {
+  let now = chrono::Utc::now();
+  let until = now + chrono::Duration::seconds(offset_secs);
+  let name = crate::unlock::variable_name(variable_stack);
+  let id = format!("dddddddddddddddddddd{:04x}", scopes.len());
+  let update = Update {
+    id: id.clone(),
+    operation: Operation::UpdateVariableValue,
+    start_ts: now.timestamp_millis(),
+    success: true,
+    status: UpdateStatus::Complete,
+    operator: setter.into(),
+    logs: vec![log(
+      "Update Variable Value",
+      &format!(
+        "updated variable '{name}'\nvalue: {}",
+        json!({
+          "stack": entry_stack,
+          "until": until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+          "scope": scopes,
+        })
+      ),
+      "",
+      true,
+    )],
+    ..Default::default()
+  };
+  let mut mock = state.lock().unwrap();
+  mock.variables.insert(
+    name.clone(),
+    Variable {
+      name,
+      value: json!({
+        "stack": entry_stack,
+        "until": until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "scope": scopes,
+      })
+      .to_string(),
+      is_secret: false,
+      ..Default::default()
+    },
+  );
+  mock.update_list.insert(0, update_item(&update));
+  mock.updates.insert(id, update);
+}
+
 fn err(msg: &str) -> (StatusCode, Json<Value>) {
   (
     StatusCode::BAD_REQUEST,
@@ -390,6 +449,20 @@ async fn handle(
   }
   let out = match (endpoint.as_str(), ty.as_str()) {
     ("read", "GetVersion") => json!({ "version": "2.2.0" }),
+    ("read", "GetVariable") => {
+      let p = parse!(GetVariable);
+      json!(
+        m.variables.get(&p.name).ok_or_else(|| err("no variable"))?
+      )
+    }
+    ("read", "GetUsername") => {
+      let p = parse!(GetUsername);
+      json!({
+        "username": format!("user-{}", p.user_id),
+        "service_user": m.service_users.contains(&p.user_id),
+        "avatar": null,
+      })
+    }
     ("read", "ListStacks") => {
       json!(m.stacks.iter().map(list_item).collect::<Vec<_>>())
     }
@@ -651,21 +724,34 @@ async fn start(policy: Policy) -> (Server, Shared) {
     secret: "s".into(),
     policy: policy.clone(),
     actor: "vogt-session:test".into(),
+    unlock_max_ttl: Duration::from_secs(14_400),
+    stale_allow_protected: false,
+  };
+  let api_user = komodo_client::entities::user::User {
+    id: "000000000000000000000001".into(),
+    username: "komodo-agents".into(),
+    enabled: true,
+    config: komodo_client::entities::user::UserConfig::Service {
+      description: String::new(),
+    },
+    ..Default::default()
   };
   let server = Server {
     komodo: Komodo::new(&config),
     policy,
     poll: Duration::from_millis(10),
     env_locks: Default::default(),
+    api_user,
+    unlock_max_ttl: Duration::from_secs(14_400),
   };
   (server, state)
 }
 
 fn policy(write: &str, allow_protected: &str) -> Policy {
+  let _ = allow_protected;
   Policy {
     write: split_list(write),
     protected: split_list("*prod*"),
-    allow_protected: split_list(allow_protected),
   }
 }
 
@@ -719,12 +805,7 @@ async fn stack_lookup_by_name_and_id() {
   );
   assert_eq!(v["count"], 1);
   assert_eq!(v["stacks"][0]["name"], "vogt-prod");
-  assert!(
-    v["stacks"][0]["mutations"]
-      .as_str()
-      .unwrap()
-      .starts_with("protected")
-  );
+  assert_eq!(v["stacks"][0]["mutations"]["state"], "protected");
   let v = text_of(
     &server
       .call_tool("stack_lookup", &json!({"query": "vogt"}))
@@ -827,7 +908,8 @@ async fn mutations_refused_when_read_only() {
 }
 
 #[tokio::test]
-async fn prod_needs_exact_opt_in_even_by_id() {
+async fn protected_stack_requires_current_audited_unlock_even_by_id()
+{
   let (server, state) = start(policy("*", "")).await;
   for stack in ["vogt-prod", PROD_ID] {
     let res = server
@@ -843,7 +925,27 @@ async fn prod_needs_exact_opt_in_even_by_id() {
   }
   assert!(!types(&state).iter().any(|t| t == "DeployStack"));
 
-  let (server, state) = start(policy("", "vogt-prod")).await;
+  let (server, state) = start(policy("*", "")).await;
+  install_unlock(
+    &state,
+    "vogt_prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  let collision = server
+    .call_tool("deploy_stack", &json!({"stack": PROD_ID}))
+    .await;
+  assert_eq!(collision["isError"], true);
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
   let v = text_of(
     &server
       .call_tool("deploy_stack", &json!({"stack": PROD_ID}))
@@ -851,6 +953,114 @@ async fn prod_needs_exact_opt_in_even_by_id() {
   );
   assert_eq!(v["pass"], true);
   assert!(types(&state).iter().any(|t| t == "DeployStack"));
+  let reasons: Vec<_> = state
+    .lock()
+    .unwrap()
+    .requests
+    .iter()
+    .filter(|(_, ty, _, _, _)| ty == "DeployStack")
+    .filter_map(|(_, _, _, _, reason)| reason.clone())
+    .collect();
+  assert!(reasons.iter().any(|r| r.starts_with("[unlock=")));
+}
+
+#[tokio::test]
+async fn unlock_scope_expiry_setter_and_reread_are_enforced() {
+  let (server, state) = start(policy("*", "")).await;
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["files"],
+    "human-1",
+    300,
+  );
+  let wrong_scope = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert!(
+    text_of(&wrong_scope)["error"]
+      .as_str()
+      .unwrap()
+      .contains("scope")
+  );
+
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    -1,
+  );
+  let expired = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert!(
+    text_of(&expired)["error"]
+      .as_str()
+      .unwrap()
+      .contains("expired")
+  );
+
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "000000000000000000000001",
+    300,
+  );
+  let own = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert!(
+    text_of(&own)["error"]
+      .as_str()
+      .unwrap()
+      .contains("own API user")
+  );
+
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "service-1",
+    300,
+  );
+  state.lock().unwrap().service_users.push("service-1".into());
+  let service = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert!(
+    text_of(&service)["error"]
+      .as_str()
+      .unwrap()
+      .contains("service user")
+  );
+
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  let first = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert_eq!(first["isError"], false, "{first}");
+  state
+    .lock()
+    .unwrap()
+    .variables
+    .remove(&crate::unlock::variable_name("vogt-prod"));
+  let second = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await;
+  assert_eq!(second["isError"], true, "{second}");
 }
 
 #[tokio::test]
@@ -1056,6 +1266,50 @@ async fn history_is_names_only_with_actor() {
     env["added"][1]["value"]["reference"],
     "[[infisical://apps/prod/HOMELAB_REF]]"
   );
+  assert!(v["unlocks"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_lists_unlocks_and_stamped_uses() {
+  let (server, state) = start(policy("*", "")).await;
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  let applied = server
+    .call_tool(
+      "deploy_stack",
+      &json!({"stack": "vogt-prod", "reason": "ship under unlock"}),
+    )
+    .await;
+  assert_eq!(applied["isError"], false, "{applied}");
+  let v = text_of(
+    &server
+      .call_tool("stack_history", &json!({"stack": "vogt-prod"}))
+      .await,
+  );
+  assert_clean(&v);
+  assert_eq!(v["unlocks"][0]["operation"], "unlock-changed");
+  assert_eq!(v["unlocks"][0]["scope"][0], "deploy");
+  assert!(v["unlocks"][0]["until"].as_str().unwrap().ends_with('Z'));
+  let reason = state
+    .lock()
+    .unwrap()
+    .requests
+    .iter()
+    .find(|(_, ty, _, _, _)| ty == "DeployStack")
+    .and_then(|(_, _, _, _, reason)| reason.clone())
+    .unwrap();
+  let id = reason
+    .strip_prefix("[unlock=")
+    .and_then(|rest| rest.split_once(" until="))
+    .map(|(id, _)| id.to_string())
+    .unwrap();
+  assert_eq!(id, v["unlocks"][0]["update_id"].as_str().unwrap());
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@ mod komodo;
 mod redact;
 mod server;
 mod tools;
+mod unlock;
 
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use crate::{
 const HELP: &str = "komodo-mcp: MCP server (stdio) for Komodo stacks
 
 USAGE:
-  komodo-mcp [--allow-write LIST] [--protected LIST] [--allow-protected LIST]
+  komodo-mcp [--allow-write LIST] [--protected LIST]
   komodo-mcp --check        verify config + connectivity, then exit
   komodo-mcp --list-tools   print the tool descriptors, then exit
 
@@ -32,7 +33,7 @@ ENVIRONMENT:
   HOMELAB_KOMODO_API_SECRET     API secret (or KOMODO_API_SECRET)
   KOMODO_MCP_WRITE_STACKS       stacks (names, * globs) mutating tools may touch; default none
   KOMODO_MCP_PROTECTED_STACKS   protected patterns; default *prod*
-  KOMODO_MCP_ALLOW_PROTECTED    exact protected stack names explicitly opted in
+  KOMODO_MCP_UNLOCK_MAX_TTL     maximum unlock lifetime in seconds (default 14400)
   KOMODO_MCP_ACTOR              actor stamped on mutations (default vogt-session:$VOGT_SESSION_ID or komodo-mcp)
 ";
 
@@ -58,13 +59,20 @@ async fn main() -> anyhow::Result<()> {
   let overrides = Overrides {
     write: take(&mut args, "--allow-write"),
     protected: take(&mut args, "--protected"),
-    allow_protected: take(&mut args, "--allow-protected"),
+    stale_allow_protected: take(&mut args, "--allow-protected")
+      .is_some(),
   };
   if let Some(unknown) = args.first() {
     anyhow::bail!("unknown argument `{unknown}` (see --help)");
   }
   let config = Config::from_env(overrides)?;
   let komodo = Komodo::new(&config);
+  let api_user = komodo.get_user().await?;
+  if config.stale_allow_protected {
+    eprintln!(
+      "komodo-mcp: warning: KOMODO_MCP_ALLOW_PROTECTED/--allow-protected is no longer honoured; use a Komodo unlock variable"
+    );
+  }
   if check {
     let version = komodo.version().await?;
     eprintln!(
@@ -73,6 +81,11 @@ async fn main() -> anyhow::Result<()> {
     );
     eprintln!("komodo-mcp: actor {:?}", config.actor);
     eprintln!("komodo-mcp: {}", instructions(&config.policy));
+    if config.stale_allow_protected {
+      eprintln!(
+        "komodo-mcp: warning: stale protected-stack opt-in ignored"
+      );
+    }
     return Ok(());
   }
   eprintln!(
@@ -89,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
     policy: config.policy,
     poll: Duration::from_secs(2),
     env_locks: Default::default(),
+    api_user,
+    unlock_max_ttl: config.unlock_max_ttl,
   })
   .await
 }

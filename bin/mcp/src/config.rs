@@ -5,7 +5,7 @@
 use anyhow::{Context, bail};
 
 /// Default protected-stack patterns: a stack whose name matches one of these
-/// can only be mutated when named exactly in `KOMODO_MCP_ALLOW_PROTECTED`.
+/// can only be mutated under a valid, time-limited Komodo unlock Variable.
 pub const DEFAULT_PROTECTED: &str = "*prod*";
 
 #[derive(Clone)]
@@ -16,6 +16,8 @@ pub struct Config {
   pub policy: Policy,
   /// Asserted actor stamped on mutating calls (`X-Komodo-Actor`).
   pub actor: String,
+  pub unlock_max_ttl: std::time::Duration,
+  pub stale_allow_protected: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -26,6 +28,7 @@ impl std::fmt::Debug for Config {
       .field("secret", &"<withheld>")
       .field("policy", &self.policy)
       .field("actor", &self.actor)
+      .field("unlock_max_ttl", &self.unlock_max_ttl)
       .finish()
   }
 }
@@ -38,8 +41,6 @@ pub struct Policy {
   pub write: Vec<String>,
   /// Stack name patterns that are protected (default `*prod*`).
   pub protected: Vec<String>,
-  /// Exact stack names that are allowed despite matching `protected`.
-  pub allow_protected: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub enum Decision {
   /// Not in the write allowlist (the read-only default).
   NotAllowlisted,
   /// Protected (e.g. prod) and not explicitly opted in by exact name.
-  Protected,
+  ProtectedNeedsUnlock,
 }
 
 impl Policy {
@@ -56,12 +57,7 @@ impl Policy {
     let protected =
       self.protected.iter().any(|p| glob_match(p, stack_name));
     if protected {
-      // Globs never unlock a protected stack: only an exact name does.
-      if self.allow_protected.iter().any(|n| n == stack_name) {
-        Decision::Allowed
-      } else {
-        Decision::Protected
-      }
+      Decision::ProtectedNeedsUnlock
     } else if self.write.iter().any(|p| glob_match(p, stack_name)) {
       Decision::Allowed
     } else {
@@ -70,7 +66,7 @@ impl Policy {
   }
 
   pub fn read_only(&self) -> bool {
-    self.write.is_empty() && self.allow_protected.is_empty()
+    self.write.is_empty()
   }
 }
 
@@ -126,7 +122,7 @@ pub fn sanitize_header(s: &str) -> String {
 pub struct Overrides {
   pub write: Option<String>,
   pub protected: Option<String>,
-  pub allow_protected: Option<String>,
+  pub stale_allow_protected: bool,
 }
 
 impl Config {
@@ -157,10 +153,16 @@ impl Config {
       .protected
       .or_else(|| env_first(&["KOMODO_MCP_PROTECTED_STACKS"]))
       .unwrap_or_else(|| DEFAULT_PROTECTED.to_string());
-    let allow_protected = o
-      .allow_protected
-      .or_else(|| env_first(&["KOMODO_MCP_ALLOW_PROTECTED"]))
-      .unwrap_or_default();
+    let stale_allow_protected = o.stale_allow_protected
+      || std::env::var_os("KOMODO_MCP_ALLOW_PROTECTED").is_some();
+    let unlock_max_ttl = env_first(&["KOMODO_MCP_UNLOCK_MAX_TTL"])
+      .map(|v| {
+        v.parse::<u64>()
+          .context("KOMODO_MCP_UNLOCK_MAX_TTL must be seconds")
+      })
+      .transpose()?
+      .map(std::time::Duration::from_secs)
+      .unwrap_or_else(|| std::time::Duration::from_secs(4 * 60 * 60));
     let actor = env_first(&["KOMODO_MCP_ACTOR"])
       .or_else(|| {
         env_first(&["VOGT_SESSION_ID", "VOGT_SESSION"])
@@ -174,9 +176,10 @@ impl Config {
       policy: Policy {
         write: split_list(&write),
         protected: split_list(&protected),
-        allow_protected: split_list(&allow_protected),
       },
       actor: sanitize_header(&actor),
+      unlock_max_ttl,
+      stale_allow_protected,
     })
   }
 }
@@ -185,11 +188,10 @@ impl Config {
 mod tests {
   use super::*;
 
-  fn policy(write: &str, protected: &str, allow: &str) -> Policy {
+  fn policy(write: &str, protected: &str, _allow: &str) -> Policy {
     Policy {
       write: split_list(write),
       protected: split_list(protected),
-      allow_protected: split_list(allow),
     }
   }
 
@@ -204,19 +206,21 @@ mod tests {
   fn globs_allow_but_never_unlock_prod() {
     let p = policy("*", DEFAULT_PROTECTED, "");
     assert_eq!(p.decide("vogt-dev"), Decision::Allowed);
-    assert_eq!(p.decide("vogt-prod"), Decision::Protected);
+    assert_eq!(p.decide("vogt-prod"), Decision::ProtectedNeedsUnlock);
     let p = policy("vogt-*", DEFAULT_PROTECTED, "");
-    assert_eq!(p.decide("vogt-prod"), Decision::Protected);
+    assert_eq!(p.decide("vogt-prod"), Decision::ProtectedNeedsUnlock);
   }
 
   #[test]
-  fn prod_requires_exact_opt_in() {
+  fn protected_always_requires_unlock() {
     let p = policy("vogt-dev", DEFAULT_PROTECTED, "vogt-prod");
-    assert_eq!(p.decide("vogt-prod"), Decision::Allowed);
-    assert_eq!(p.decide("other-prod"), Decision::Protected);
-    // A glob in the opt-in list is treated literally, not as a pattern.
+    assert_eq!(p.decide("vogt-prod"), Decision::ProtectedNeedsUnlock);
+    assert_eq!(
+      p.decide("other-prod"),
+      Decision::ProtectedNeedsUnlock
+    );
     let p = policy("", DEFAULT_PROTECTED, "*prod*");
-    assert_eq!(p.decide("vogt-prod"), Decision::Protected);
+    assert_eq!(p.decide("vogt-prod"), Decision::ProtectedNeedsUnlock);
   }
 
   #[test]

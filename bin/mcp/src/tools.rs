@@ -30,6 +30,7 @@ use crate::{
   redact::{
     Scrubber, env_view, project_stack, strip_html, tail, truncate,
   },
+  unlock::{self, Unlock},
 };
 
 /// Log stage that carries file content in WriteStackContents updates.
@@ -48,6 +49,8 @@ pub struct Ctx<'a> {
   /// One lock per stack id, so two calls in this process cannot interleave
   /// a read-modify-write of the same environment.
   pub env_locks: &'a EnvLocks,
+  pub api_user: &'a komodo_client::entities::user::User,
+  pub unlock_max_ttl: Duration,
 }
 
 /// Per-stack mutexes shared by every call on one server.
@@ -225,15 +228,31 @@ async fn fetch(ctx: &Ctx<'_>, stack: &str) -> anyhow::Result<Stack> {
   Ok(s)
 }
 
-fn decision_json(policy: &Policy, name: &str) -> Value {
-  match policy.decide(name) {
+async fn decision_json(ctx: &Ctx<'_>, name: &str) -> Value {
+  match ctx.policy.decide(name) {
     Decision::Allowed => json!("allowed"),
     Decision::NotAllowlisted => {
       json!("read-only (not in KOMODO_MCP_WRITE_STACKS)")
     }
-    Decision::Protected => json!(
-      "protected (requires exact name in KOMODO_MCP_ALLOW_PROTECTED)"
-    ),
+    Decision::ProtectedNeedsUnlock => match unlock::resolve_status(
+      ctx.komodo,
+      ctx.api_user,
+      name,
+      ctx.unlock_max_ttl,
+    )
+    .await
+    {
+      Ok(grant) => json!({
+        "state": "unlocked",
+        "until": grant.until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "scope": grant.scope,
+        "by": grant.by,
+        "update_id": grant.id,
+      }),
+      Err(error) => {
+        json!({"state": "protected", "detail": error.to_string()})
+      }
+    },
   }
 }
 
@@ -242,22 +261,28 @@ fn decision_json(policy: &Policy, name: &str) -> Value {
 async fn fetch_mutable(
   ctx: &Ctx<'_>,
   stack: &str,
-) -> anyhow::Result<Stack> {
+  scope: &str,
+) -> anyhow::Result<(Stack, Option<Unlock>)> {
   let s = fetch(ctx, stack).await?;
   match ctx.policy.decide(&s.name) {
-    Decision::Allowed => Ok(s),
+    Decision::Allowed => Ok((s, None)),
     Decision::NotAllowlisted => Err(anyhow!(
       "refused: stack `{}` is not in the mutation allowlist. This server is \
        read-only for it; add it to KOMODO_MCP_WRITE_STACKS to allow writes \
        and deploys.",
       s.name
     )),
-    Decision::Protected => Err(anyhow!(
-      "refused: stack `{}` is protected (matches KOMODO_MCP_PROTECTED_STACKS). \
-       Mutating it requires its exact name in KOMODO_MCP_ALLOW_PROTECTED. \
-       Remember a prod deploy kills sessions living in the prod pod.",
-      s.name
-    )),
+    Decision::ProtectedNeedsUnlock => {
+      let grant = unlock::resolve(
+        ctx.komodo,
+        ctx.api_user,
+        &s.name,
+        scope,
+        ctx.unlock_max_ttl,
+      )
+      .await?;
+      Ok((s, Some(grant)))
+    }
   }
 }
 
@@ -282,10 +307,9 @@ async fn stack_lookup(
       })
       .collect()
   };
-  let items: Vec<Value> = matches
-    .iter()
-    .map(|s| {
-      json!({
+  let mut items = Vec::with_capacity(matches.len());
+  for s in matches {
+    items.push(json!({
         "id": s.id,
         "name": s.name,
         "server_id": s.info.server_id,
@@ -302,10 +326,9 @@ async fn stack_lookup(
         "services": s.info.services.iter().map(|x| json!({
           "service": x.service, "image": x.image, "update_available": x.update_available
         })).collect::<Vec<_>>(),
-        "mutations": decision_json(ctx.policy, &s.name),
-      })
-    })
-    .collect();
+        "mutations": decision_json(ctx, &s.name).await,
+      }));
+  }
   Ok(json!({ "count": items.len(), "stacks": items }))
 }
 
@@ -315,7 +338,7 @@ async fn get_stack(
 ) -> anyhow::Result<Value> {
   let s = fetch(ctx, arg_str(args, "stack")?).await?;
   let mut v = project_stack(&s);
-  v["mutations"] = decision_json(ctx.policy, &s.name);
+  v["mutations"] = decision_json(ctx, &s.name).await;
   Ok(v)
 }
 
@@ -591,7 +614,8 @@ async fn write_stack_file(
     .and_then(Value::as_str)
     .context("missing string argument `content`")?;
   let reason = opt_str(args, "reason");
-  let s = fetch_mutable(ctx, name).await?;
+  let (s, unlock) = fetch_mutable(ctx, name, "files").await?;
+  let stamped = unlock::stamped_reason(unlock.as_ref(), reason);
   if is_env_path(&s, path) {
     bail!(
       "refused: `{path}` is an env file. Writing it would commit secret \
@@ -600,7 +624,7 @@ async fn write_stack_file(
   }
   // Refresh first: diffing against or writing over a stale cache is how
   // earlier deploys clobbered newer commits.
-  ctx.komodo.refresh_cache(&s.id, reason).await?;
+  ctx.komodo.refresh_cache(&s.id, stamped.as_deref()).await?;
   let s = fetch(ctx, &s.id).await?;
   let before = cached_file(&s, path);
   let change = diff_file(before, content);
@@ -616,9 +640,11 @@ async fn write_stack_file(
       "new_file": before.is_none(), "change": change,
     }));
   }
-  let update =
-    ctx.komodo.write_file(&s.id, path, content, reason).await?;
-  ctx.komodo.refresh_cache(&s.id, reason).await?;
+  let update = ctx
+    .komodo
+    .write_file(&s.id, path, content, stamped.as_deref())
+    .await?;
+  ctx.komodo.refresh_cache(&s.id, stamped.as_deref()).await?;
   let after = fetch(ctx, &s.id).await?;
   let verified = cached_file(&after, path) == Some(content);
   Ok(json!({
@@ -660,7 +686,8 @@ async fn deploy_stack(
   let timeout = Duration::from_secs(
     opt_u64(args, "timeout_secs", 900).clamp(10, 3600),
   );
-  let s = fetch_mutable(ctx, name).await?;
+  let (s, unlock) = fetch_mutable(ctx, name, "deploy").await?;
+  let stamped = unlock::stamped_reason(unlock.as_ref(), reason);
   let state = ctx.komodo.action_state(&s.id).await?;
   if state.deploying
     || state.pulling
@@ -669,7 +696,10 @@ async fn deploy_stack(
   {
     bail!("refused: stack `{}` is busy ({state:?})", s.name);
   }
-  let started = ctx.komodo.deploy(&s.id, services, reason).await?;
+  let started = ctx
+    .komodo
+    .deploy(&s.id, services, stamped.as_deref())
+    .await?;
   if started.id.is_empty() {
     bail!("Komodo did not return an update id for the deploy");
   }
@@ -850,6 +880,9 @@ async fn stack_history(
       if interesting {
         let u = ctx.komodo.get_update(&item.id).await?;
         e["actor"] = actor_of(&u);
+        if let Some(id) = unlock::unlock_id_from_actor(&u) {
+          e["unlock"] = json!(id);
+        }
         match u.operation {
           Operation::UpdateStack | Operation::CreateStack => {
             e["config_diff"] =
@@ -899,11 +932,13 @@ async fn stack_history(
       _ => break,
     }
   }
+  let unlocks = unlock::history(ctx.komodo, &s.name).await?;
   Ok(json!({
     "stack": s.name,
     "count": entries.len(),
     "reached_last_successful_deploy": if since_deploy { json!(reached_deploy) } else { Value::Null },
     "updates": entries,
+    "unlocks": unlocks,
     "current_environment": env_view(&s.config.environment),
   }))
 }
@@ -1114,7 +1149,8 @@ async fn edit_stack_env(
   let if_base = args.get("if_base").and_then(|v| v.as_str());
 
   // Gate first (existing allowlist / protected check). K3 adds Scope.
-  let stack = fetch_mutable(ctx, stack_key).await?;
+  let (stack, unlock) = fetch_mutable(ctx, stack_key, "env").await?;
+  let stamped = unlock::stamped_reason(unlock.as_ref(), Some(reason));
   let guard = ctx.env_locks.lock_for(&stack.id);
   let _held = guard.lock().await;
 
@@ -1128,7 +1164,7 @@ async fn edit_stack_env(
   }
   ctx
     .komodo
-    .refresh_cache(&stack.id, Some(reason))
+    .refresh_cache(&stack.id, stamped.as_deref())
     .await
     .context("RefreshStackCache failed")?;
   let stack = ctx.komodo.get_stack(&stack.id).await?;
@@ -1181,7 +1217,7 @@ async fn edit_stack_env(
         environment: Some(new_env.clone()),
         ..Default::default()
       },
-      Some(reason),
+      stamped.as_deref(),
     )
     .await
     .context("UpdateStack failed")?;
@@ -1250,7 +1286,9 @@ async fn edit_stack_command(
   let if_fingerprint =
     args.get("if_fingerprint").and_then(Value::as_str);
 
-  let stack = fetch_mutable(ctx, stack_key).await?;
+  let (stack, unlock) =
+    fetch_mutable(ctx, stack_key, "command").await?;
+  let stamped = unlock::stamped_reason(unlock.as_ref(), Some(reason));
   let guard = ctx.env_locks.lock_for(&stack.id);
   let _held = guard.lock().await;
   let state = ctx.komodo.action_state(&stack.id).await?;
@@ -1263,7 +1301,7 @@ async fn edit_stack_command(
   }
   ctx
     .komodo
-    .refresh_cache(&stack.id, Some(reason))
+    .refresh_cache(&stack.id, stamped.as_deref())
     .await
     .context("RefreshStackCache failed")?;
   let stack = ctx.komodo.get_stack(&stack.id).await?;
@@ -1347,7 +1385,7 @@ async fn edit_stack_command(
   let t0 = chrono_now_ms();
   ctx
     .komodo
-    .update_stack_partial(&stack.id, partial, Some(reason))
+    .update_stack_partial(&stack.id, partial, stamped.as_deref())
     .await
     .context("UpdateStack failed")?;
   let update = find_env_update(ctx, &stack.id, t0).await?;
