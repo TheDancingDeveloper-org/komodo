@@ -79,6 +79,11 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history so an ancestor tag can be described. The fork does not
+          # publish upstream's release tags, so the version step fetches those
+          # from moghtech/komodo when Cargo.toml no longer carries a version.
+          fetch-depth: 0
 
       # Authenticate to Docker Hub first: the build pulls rust, debian and deno
       # base images from it, and unauthenticated pulls hit the shared runner's
@@ -109,9 +114,15 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          git fetch --tags --quiet origin || true
-          version="$(git describe --tags --abbrev=0 --exclude='*-dev-*' --match 'v[0-9]*')"
-          version="${version#v}"
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          # v2.3.4 and later publish the workspace version as 0.0.0. The fork
+          # does not carry upstream's tags, so describe them from moghtech/komodo.
+          if [ -z "$version" ] || [ "$version" = "0.0.0" ]; then
+            git fetch --tags --quiet https://github.com/moghtech/komodo.git
+            version="$(git describe --tags --abbrev=0 --exclude='*-dev-*' --match 'v[0-9]*')"
+            version="${version#v}"
+          fi
           test -n "$version"
           test "$version" != "0.0.0"
           # ghcr.io/moghtech/komodo-ui is published as the major (":2"), not
