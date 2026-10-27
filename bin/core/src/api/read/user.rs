@@ -38,7 +38,7 @@ impl Resolve<ReadArgs> for GetUsername {
     if let Some(user) = admin_service_user(&self.user_id) {
       return Ok(GetUsernameResponse {
         username: user.username,
-        service_user: true,
+        service_user: Some(true),
         avatar: None,
       });
     }
@@ -48,6 +48,8 @@ impl Resolve<ReadArgs> for GetUsername {
       .context("failed at mongo query for user")?
       .context("no user found with id")?;
 
+    let service_user =
+      matches!(user.config, UserConfig::Service { .. });
     let avatar = match user.config {
       UserConfig::Github { avatar, .. } => Some(avatar),
       UserConfig::Google { avatar, .. } => Some(avatar),
@@ -56,7 +58,7 @@ impl Resolve<ReadArgs> for GetUsername {
 
     Ok(GetUsernameResponse {
       username: user.username,
-      service_user: matches!(user.config, UserConfig::Service { .. }),
+      service_user: Some(service_user),
       avatar,
     })
   }

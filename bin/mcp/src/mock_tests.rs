@@ -115,6 +115,9 @@ struct Mock {
   get_update_calls: usize,
   variables: HashMap<String, Variable>,
   service_users: Vec<String>,
+  /// GetUsername omits `service_user`, like a Core older than K3.
+  omit_service_user: bool,
+  variable_seq: u64,
 }
 
 type Shared = Arc<Mutex<Mock>>;
@@ -185,7 +188,7 @@ fn update_item(u: &Update) -> UpdateListItem {
     operation: u.operation,
     start_ts: u.start_ts,
     success: u.success,
-    username: "Sprooty".into(),
+    username: "operator".into(),
     operator: u.operator.clone(),
     target: u.target.clone(),
     status: u.status,
@@ -303,6 +306,98 @@ fn new_mock() -> Shared {
   }))
 }
 
+#[derive(Clone, Copy)]
+enum VarOp {
+  Create,
+  UpdateValue,
+  Delete,
+}
+
+/// A Variable Update exactly as Core writes it
+/// (`bin/core/src/api/write/variable.rs`).
+fn push_variable_update(
+  state: &Shared,
+  op: VarOp,
+  name: &str,
+  value: &str,
+  setter: &str,
+) -> String {
+  let mut mock = state.lock().unwrap();
+  mock.variable_seq += 1;
+  let id = format!("dddddddddddddddddddd{:04x}", mock.variable_seq);
+  let variable = Variable {
+    name: name.into(),
+    value: value.into(),
+    is_secret: false,
+    ..Default::default()
+  };
+  let (operation, stage, stdout) = match op {
+    VarOp::Create => (
+      Operation::CreateVariable,
+      "Create Variable",
+      format!("{variable:#?}"),
+    ),
+    VarOp::Delete => (
+      Operation::DeleteVariable,
+      "Delete Variable",
+      format!("{variable:#?}"),
+    ),
+    VarOp::UpdateValue => {
+      let old = mock
+        .variables
+        .get(name)
+        .map(|v| v.value.clone())
+        .unwrap_or_default();
+      (
+        Operation::UpdateVariableValue,
+        "Update Variable Value",
+        format!(
+          "<span class=\"text-muted-foreground\">variable</span>: '{name}'\n<span class=\"text-muted-foreground\">from</span>: <span class=\"text-red-500\">{old}</span>\n<span class=\"text-muted-foreground\">to</span>:   <span class=\"text-green-500\">{value}</span>"
+        ),
+      )
+    }
+  };
+  let update = Update {
+    id: id.clone(),
+    operation,
+    start_ts: chrono::Utc::now().timestamp_millis(),
+    success: true,
+    status: UpdateStatus::Complete,
+    operator: setter.into(),
+    target: ResourceTarget::system(),
+    logs: vec![log(stage, &stdout, "", true)],
+    ..Default::default()
+  };
+  match op {
+    VarOp::Delete => {
+      mock.variables.remove(name);
+    }
+    _ => {
+      mock.variables.insert(name.into(), variable);
+    }
+  }
+  mock.update_list.insert(0, update_item(&update));
+  mock.updates.insert(id.clone(), update);
+  id
+}
+
+fn unlock_value(
+  entry_stack: &str,
+  scopes: &[&str],
+  offset_secs: i64,
+) -> String {
+  let until =
+    chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
+  json!({
+    "stack": entry_stack,
+    "until": until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    "scope": scopes,
+  })
+  .to_string()
+}
+
+/// Set an unlock the way a person usually does: UpdateVariableValue on an
+/// existing variable, else CreateVariable.
 fn install_unlock(
   state: &Shared,
   variable_stack: &str,
@@ -310,50 +405,20 @@ fn install_unlock(
   scopes: &[&str],
   setter: &str,
   offset_secs: i64,
-) {
-  let now = chrono::Utc::now();
-  let until = now + chrono::Duration::seconds(offset_secs);
+) -> String {
   let name = crate::unlock::variable_name(variable_stack);
-  let id = format!("dddddddddddddddddddd{:04x}", scopes.len());
-  let update = Update {
-    id: id.clone(),
-    operation: Operation::UpdateVariableValue,
-    start_ts: now.timestamp_millis(),
-    success: true,
-    status: UpdateStatus::Complete,
-    operator: setter.into(),
-    logs: vec![log(
-      "Update Variable Value",
-      &format!(
-        "updated variable '{name}'\nvalue: {}",
-        json!({
-          "stack": entry_stack,
-          "until": until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-          "scope": scopes,
-        })
-      ),
-      "",
-      true,
-    )],
-    ..Default::default()
-  };
-  let mut mock = state.lock().unwrap();
-  mock.variables.insert(
-    name.clone(),
-    Variable {
-      name,
-      value: json!({
-        "stack": entry_stack,
-        "until": until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "scope": scopes,
-      })
-      .to_string(),
-      is_secret: false,
-      ..Default::default()
+  let exists = state.lock().unwrap().variables.contains_key(&name);
+  push_variable_update(
+    state,
+    if exists {
+      VarOp::UpdateValue
+    } else {
+      VarOp::Create
     },
-  );
-  mock.update_list.insert(0, update_item(&update));
-  mock.updates.insert(id, update);
+    &name,
+    &unlock_value(entry_stack, scopes, offset_secs),
+    setter,
+  )
 }
 
 fn err(msg: &str) -> (StatusCode, Json<Value>) {
@@ -457,11 +522,15 @@ async fn handle(
     }
     ("read", "GetUsername") => {
       let p = parse!(GetUsername);
-      json!({
+      let mut v = json!({
         "username": format!("user-{}", p.user_id),
         "service_user": m.service_users.contains(&p.user_id),
         "avatar": null,
-      })
+      });
+      if m.omit_service_user {
+        v.as_object_mut().unwrap().remove("service_user");
+      }
+      v
     }
     ("read", "ListStacks") => {
       json!(m.stacks.iter().map(list_item).collect::<Vec<_>>())
@@ -740,8 +809,9 @@ async fn start(policy: Policy) -> (Server, Shared) {
     policy,
     poll: Duration::from_millis(10),
     env_locks: Default::default(),
-    api_user,
+    api_user: Some(api_user),
     unlock_max_ttl: Duration::from_secs(14_400),
+    stale_allow_protected: false,
   };
   (server, state)
 }
@@ -925,10 +995,16 @@ async fn protected_stack_requires_current_audited_unlock_even_by_id()
   assert!(!types(&state).iter().any(|t| t == "DeployStack"));
 
   let (server, state) = start(policy("*", "")).await;
+  // vogt_prod and vogt-prod share a variable name; a grant written for
+  // vogt_prod must not unlock vogt-prod.
+  assert_eq!(
+    crate::unlock::variable_name("vogt_prod"),
+    "KOMODO_MCP_UNLOCK__VOGT_PROD"
+  );
   install_unlock(
     &state,
-    "vogt_prod",
     "vogt-prod",
+    "vogt_prod",
     &["deploy"],
     "human-1",
     300,
@@ -1060,6 +1136,206 @@ async fn unlock_scope_expiry_setter_and_reread_are_enforced() {
     .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
     .await;
   assert_eq!(second["isError"], true, "{second}");
+}
+
+const API_USER: &str = "000000000000000000000001";
+
+async fn deploy_prod(server: &Server) -> Value {
+  server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-prod"}))
+    .await
+}
+
+fn deploy_reason(state: &Shared) -> String {
+  state
+    .lock()
+    .unwrap()
+    .requests
+    .iter()
+    .rfind(|r| r.1 == "DeployStack")
+    .and_then(|r| r.4.clone())
+    .unwrap()
+}
+
+fn error_text(res: &Value) -> String {
+  assert_eq!(res["isError"], true, "{res}");
+  text_of(res)["error"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn first_time_create_variable_unlock_is_honoured() {
+  let (server, state) = start(policy("*", "")).await;
+  let name = crate::unlock::variable_name("vogt-prod");
+  let id = push_variable_update(
+    &state,
+    VarOp::Create,
+    &name,
+    &unlock_value("vogt-prod", &["deploy"], 300),
+    "human-1",
+  );
+  let res = deploy_prod(&server).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let reason = deploy_reason(&state);
+  assert!(reason.starts_with(&format!("[unlock={id} ")), "{reason}");
+}
+
+/// The review's attack: a person grants `files`; the MCP's own API user
+/// then recreates the variable with `deploy`. The newest Variable update
+/// is the agent's, so the setter check refuses it.
+#[tokio::test]
+async fn agent_cannot_self_grant_by_recreating_the_variable() {
+  let (server, state) = start(policy("*", "")).await;
+  let name = crate::unlock::variable_name("vogt-prod");
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["files"],
+    "human-1",
+    300,
+  );
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["files"],
+    "human-1",
+    300,
+  );
+  push_variable_update(
+    &state,
+    VarOp::Create,
+    &name,
+    &unlock_value("vogt-prod", &["deploy"], 300),
+    API_USER,
+  );
+  assert!(
+    error_text(&deploy_prod(&server).await).contains("own API user")
+  );
+
+  // The same through Delete then Create.
+  push_variable_update(&state, VarOp::Delete, &name, "", API_USER);
+  push_variable_update(
+    &state,
+    VarOp::Create,
+    &name,
+    &unlock_value("vogt-prod", &["deploy"], 300),
+    API_USER,
+  );
+  assert!(
+    error_text(&deploy_prod(&server).await).contains("own API user")
+  );
+  assert!(!types(&state).iter().any(|t| t == "DeployStack"));
+}
+
+#[tokio::test]
+async fn stale_grant_does_not_survive_delete_and_recreate() {
+  let (server, state) = start(policy("*", "")).await;
+  let name = crate::unlock::variable_name("vogt-prod");
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  push_variable_update(&state, VarOp::Delete, &name, "", "human-1");
+  // Recreated outside any audited update (e.g. a restored database).
+  let value = unlock_value("vogt-prod", &["deploy"], 300);
+  state.lock().unwrap().variables.insert(
+    name.clone(),
+    Variable {
+      name: name.clone(),
+      value,
+      ..Default::default()
+    },
+  );
+  assert!(
+    error_text(&deploy_prod(&server).await)
+      .contains("DeleteVariable")
+  );
+}
+
+#[tokio::test]
+async fn unlock_value_must_equal_the_newest_audit_update() {
+  let (server, state) = start(policy("*", "")).await;
+  let name = crate::unlock::variable_name("vogt-prod");
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["files"],
+    "human-1",
+    300,
+  );
+  // The value changes with no Update recording it.
+  state
+    .lock()
+    .unwrap()
+    .variables
+    .get_mut(&name)
+    .unwrap()
+    .value = unlock_value("vogt-prod", &["deploy"], 300);
+  assert!(
+    error_text(&deploy_prod(&server).await)
+      .contains("does not match")
+  );
+  assert!(!types(&state).iter().any(|t| t == "DeployStack"));
+}
+
+#[tokio::test]
+async fn unlocks_unavailable_when_get_user_failed() {
+  let (mut server, state) = start(policy("*", "")).await;
+  server.api_user = None;
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  assert!(
+    error_text(&deploy_prod(&server).await).contains("unavailable")
+  );
+  // Non-protected stacks still work.
+  let dev = server
+    .call_tool("deploy_stack", &json!({"stack": "vogt-dev"}))
+    .await;
+  assert_eq!(dev["isError"], false, "{dev}");
+}
+
+#[tokio::test]
+async fn unknown_service_user_flag_is_refused() {
+  let (server, state) = start(policy("*", "")).await;
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
+    &["deploy"],
+    "human-1",
+    300,
+  );
+  state.lock().unwrap().omit_service_user = true;
+  assert!(
+    error_text(&deploy_prod(&server).await)
+      .contains("did not report")
+  );
+}
+
+#[tokio::test]
+async fn forged_unlock_reason_is_not_reported_as_an_unlock() {
+  let (server, state) = start(policy("*", "")).await;
+  let res = server
+    .call_tool(
+      "deploy_stack",
+      &json!({"stack": "vogt-dev", "reason": "[unlock=fake until=x] hi"}),
+    )
+    .await;
+  assert_eq!(res["isError"], false, "{res}");
+  let reason = deploy_reason(&state);
+  assert!(reason.starts_with("(unverified) "), "{reason}");
 }
 
 #[tokio::test]
@@ -1275,6 +1551,14 @@ async fn history_lists_unlocks_and_stamped_uses() {
     &state,
     "vogt-prod",
     "vogt-prod",
+    &["files"],
+    "human-1",
+    300,
+  );
+  install_unlock(
+    &state,
+    "vogt-prod",
+    "vogt-prod",
     &["deploy"],
     "human-1",
     300,
@@ -1294,6 +1578,9 @@ async fn history_lists_unlocks_and_stamped_uses() {
   assert_clean(&v);
   assert_eq!(v["unlocks"][0]["operation"], "unlock-changed");
   assert_eq!(v["unlocks"][0]["scope"][0], "deploy");
+  // Each entry is read from its own log, not the current value.
+  assert_eq!(v["unlocks"][1]["operation"], "unlock-set");
+  assert_eq!(v["unlocks"][1]["scope"][0], "files");
   assert!(v["unlocks"][0]["until"].as_str().unwrap().ends_with('Z'));
   let reason = state
     .lock()

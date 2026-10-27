@@ -17,7 +17,9 @@ mod mock_tests;
 use crate::{
   config::{Config, Overrides},
   komodo::Komodo,
-  server::{Server, instructions, serve_stdio},
+  server::{
+    STALE_ALLOW_PROTECTED, Server, instructions, serve_stdio,
+  },
 };
 
 const HELP: &str = "komodo-mcp: MCP server (stdio) for Komodo stacks
@@ -66,13 +68,22 @@ async fn main() -> anyhow::Result<()> {
     anyhow::bail!("unknown argument `{unknown}` (see --help)");
   }
   let config = Config::from_env(overrides)?;
-  let komodo = Komodo::new(&config);
-  let api_user = komodo.get_user().await?;
+  // Before any Core call, so a failing Core cannot hide it.
   if config.stale_allow_protected {
-    eprintln!(
-      "komodo-mcp: warning: KOMODO_MCP_ALLOW_PROTECTED/--allow-protected is no longer honoured; use a Komodo unlock variable"
-    );
+    eprintln!("komodo-mcp: warning: {STALE_ALLOW_PROTECTED}");
   }
+  let komodo = Komodo::new(&config);
+  // GetUser on /read is newer than some Cores: degrade (protected stacks
+  // stay refused) rather than exit. Deploy Core first, then the MCP.
+  let api_user = match komodo.get_user().await {
+    Ok(user) => Some(user),
+    Err(e) => {
+      eprintln!(
+        "komodo-mcp: warning: GetUser failed ({e:#}); protected-stack unlocks are unavailable until Core is upgraded"
+      );
+      None
+    }
+  };
   if check {
     let version = komodo.version().await?;
     eprintln!(
@@ -80,7 +91,18 @@ async fn main() -> anyhow::Result<()> {
       config.url
     );
     eprintln!("komodo-mcp: actor {:?}", config.actor);
-    eprintln!("komodo-mcp: {}", instructions(&config.policy));
+    match &api_user {
+      Some(user) => {
+        eprintln!("komodo-mcp: api user {:?}", user.username)
+      }
+      None => {
+        eprintln!("komodo-mcp: api user unknown; unlocks unavailable")
+      }
+    }
+    eprintln!(
+      "komodo-mcp: {}",
+      instructions(&config.policy, config.stale_allow_protected)
+    );
     if config.stale_allow_protected {
       eprintln!(
         "komodo-mcp: warning: stale protected-stack opt-in ignored"
@@ -104,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     env_locks: Default::default(),
     api_user,
     unlock_max_ttl: config.unlock_max_ttl,
+    stale_allow_protected: config.stale_allow_protected,
   })
   .await
 }
