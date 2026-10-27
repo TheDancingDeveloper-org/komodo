@@ -27,8 +27,11 @@ pub struct Server {
   pub policy: Policy,
   pub poll: Duration,
   pub env_locks: EnvLocks,
-  pub api_user: User,
+  /// `None` when `GetUser` failed at startup: unlocks are then refused.
+  pub api_user: Option<User>,
   pub unlock_max_ttl: Duration,
+  /// KOMODO_MCP_ALLOW_PROTECTED / --allow-protected was set (ignored).
+  pub stale_allow_protected: bool,
 }
 
 impl Server {
@@ -42,7 +45,7 @@ impl Server {
       scrubber: &scrubber,
       poll: self.poll,
       env_locks: &self.env_locks,
-      api_user: &self.api_user,
+      api_user: self.api_user.as_ref(),
       unlock_max_ttl: self.unlock_max_ttl,
     };
     let (mut body, is_error) =
@@ -83,7 +86,7 @@ impl Server {
             "name": "komodo-mcp",
             "version": env!("CARGO_PKG_VERSION"),
           },
-          "instructions": instructions(&self.policy),
+          "instructions": instructions(&self.policy, self.stale_allow_protected),
         }))
       }
       "ping" => Ok(json!({})),
@@ -113,7 +116,12 @@ impl Server {
   }
 }
 
-pub fn instructions(policy: &Policy) -> String {
+pub const STALE_ALLOW_PROTECTED: &str = "KOMODO_MCP_ALLOW_PROTECTED is no longer honoured; use a Komodo unlock variable";
+
+pub fn instructions(
+  policy: &Policy,
+  stale_allow_protected: bool,
+) -> String {
   let mode = if policy.read_only() {
     String::from(
       "This server is READ-ONLY: write_stack_file and deploy_stack will refuse every stack.",
@@ -124,13 +132,18 @@ pub fn instructions(policy: &Policy) -> String {
       policy.write, policy.protected
     )
   };
+  let stale = if stale_allow_protected {
+    format!(" WARNING: {STALE_ALLOW_PROTECTED}.")
+  } else {
+    String::new()
+  };
   format!(
     "Komodo stacks via typed tools; use these instead of curl against the Komodo API. \
      Secrets are redacted server-side: env is names + fingerprints only. {mode} \
      Typical deploy: stack_lookup -> read_stack_file -> write_stack_file -> deploy_stack -> container_health. \
      Change one env key with edit_stack_env (an [[infisical://alias/env/KEY]] reference only; never a literal). \
      Append or replace pre_deploy/post_deploy with edit_stack_command; replace requires the current fingerprint and literal secrets are refused. \
-     To answer 'what changed and who': stack_history(since_last_successful_deploy=true) or env_diff(against={{last_successful_deploy:true}})."
+     To answer 'what changed and who': stack_history(since_last_successful_deploy=true) or env_diff(against={{last_successful_deploy:true}}).{stale}"
   )
 }
 

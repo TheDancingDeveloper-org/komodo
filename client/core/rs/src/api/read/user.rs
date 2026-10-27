@@ -207,8 +207,10 @@ pub struct GetUsername {
 pub struct GetUsernameResponse {
   /// The username of the user.
   pub username: String,
-  /// Whether the user is a service user.
-  pub service_user: bool,
+  /// Whether the user is a service user. `None` from a Core that
+  /// predates this field; callers making security decisions must treat
+  /// `None` as unknown, never as `false`.
+  pub service_user: Option<bool>,
   /// An optional icon for the user.
   pub avatar: Option<String>,
 }

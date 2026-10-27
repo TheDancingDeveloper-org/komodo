@@ -19,8 +19,6 @@ use komodo_client::entities::{
 use periphery_client::api::{self, GetVersionResponse};
 use tokio::sync::Mutex;
 
-#[cfg(feature = "aws")]
-use crate::helpers::update::update_update;
 use crate::{
   cloud::BuildCleanupData,
   connection::PeripheryConnectionArgs,
@@ -28,6 +26,8 @@ use crate::{
   resource,
   state::{builder_usage_cache, server_status_cache},
 };
+#[cfg(feature = "aws")]
+use crate::helpers::update::update_update;
 
 use super::periphery_client;
 
@@ -150,8 +150,7 @@ async fn get_aws_builder(
   mut update: Option<&mut Update>,
 ) -> anyhow::Result<(PeripheryClient, BuildCleanupData)> {
   use crate::cloud::aws::ec2::{
-    Ec2Instance, launch_ec2_instance,
-    terminate_ec2_instance_with_retry,
+    Ec2Instance, launch_ec2_instance, terminate_ec2_instance_with_retry,
   };
   let start_create_ts = komodo_timestamp();
 

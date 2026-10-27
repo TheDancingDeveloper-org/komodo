@@ -49,7 +49,9 @@ pub struct Ctx<'a> {
   /// One lock per stack id, so two calls in this process cannot interleave
   /// a read-modify-write of the same environment.
   pub env_locks: &'a EnvLocks,
-  pub api_user: &'a komodo_client::entities::user::User,
+  /// This MCP's own Komodo user; `None` when `GetUser` failed at startup
+  /// (an older Core), in which case every unlock is refused.
+  pub api_user: Option<&'a komodo_client::entities::user::User>,
   pub unlock_max_ttl: Duration,
 }
 
@@ -847,6 +849,11 @@ async fn stack_history(
   let limit = opt_u64(args, "limit", 15).clamp(1, 100) as usize;
   let since_deploy =
     opt_bool(args, "since_last_successful_deploy", false);
+  let unlocks = unlock::history(ctx.komodo, &s.name).await?;
+  let grant_ids: std::collections::HashSet<&str> = unlocks
+    .iter()
+    .filter_map(|u| u["update_id"].as_str())
+    .collect();
   let mut entries = Vec::new();
   let mut page = 0;
   let mut reached_deploy = false;
@@ -881,7 +888,14 @@ async fn stack_history(
         let u = ctx.komodo.get_update(&item.id).await?;
         e["actor"] = actor_of(&u);
         if let Some(id) = unlock::unlock_id_from_actor(&u) {
-          e["unlock"] = json!(id);
+          // A reason is client-written: only an id that is one of this
+          // stack's unlock grants is reported as one.
+          let key = if grant_ids.contains(id.as_str()) {
+            "unlock"
+          } else {
+            "unlock_unverified"
+          };
+          e[key] = json!(id);
         }
         match u.operation {
           Operation::UpdateStack | Operation::CreateStack => {
@@ -932,7 +946,6 @@ async fn stack_history(
       _ => break,
     }
   }
-  let unlocks = unlock::history(ctx.komodo, &s.name).await?;
   Ok(json!({
     "stack": s.name,
     "count": entries.len(),
