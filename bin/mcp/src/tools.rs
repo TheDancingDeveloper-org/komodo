@@ -11,7 +11,8 @@ use tokio::sync::Mutex;
 
 use anyhow::{Context, anyhow, bail};
 use komodo_client::entities::{
-  Operation,
+  Operation, SystemCommand,
+  stack::_PartialStackConfig,
   stack::Stack,
   update::{Log, Update, UpdateStatus},
 };
@@ -128,6 +129,21 @@ pub fn list() -> Value {
       "annotations": {"destructiveHint": true},
     },
     {
+      "name": "edit_stack_command",
+      "description": "Append to or replace an allowlisted stack's pre_deploy or post_deploy command. Replace requires the current command fingerprint. Literal secrets are refused. The old command is never returned. Does not deploy.",
+      "inputSchema": {"type": "object", "properties": {
+        "stack": stack,
+        "which": {"type": "string", "enum": ["pre_deploy", "post_deploy"]},
+        "op": {"type": "string", "enum": ["append", "replace"]},
+        "command": {"type": "string"},
+        "path": {"type": "string"},
+        "if_fingerprint": {"type": "string", "description": "Required for replace; fingerprint of the current command from get_stack."},
+        "reason": reason,
+        "dry_run": {"type": "boolean", "default": false}
+      }, "required": ["stack", "which", "op", "command", "reason"]},
+      "annotations": {"destructiveHint": true},
+    },
+    {
       "name": "container_health",
       "description": "Per-service container state and docker health check status for a stack (no env, labels or inspect dump).",
       "inputSchema": {"type": "object", "properties": {"stack": stack}, "required": ["stack"]},
@@ -192,6 +208,7 @@ pub async fn call(
     "read_stack_file" => read_stack_file(ctx, args).await,
     "write_stack_file" => write_stack_file(ctx, args).await,
     "edit_stack_env" => edit_stack_env(ctx, args).await,
+    "edit_stack_command" => edit_stack_command(ctx, args).await,
     "deploy_stack" => deploy_stack(ctx, args).await,
     "container_health" => container_health(ctx, args).await,
     "container_logs" => container_logs(ctx, args).await,
@@ -1158,7 +1175,14 @@ async fn edit_stack_env(
   let t0 = chrono_now_ms();
   let _written = ctx
     .komodo
-    .update_stack_partial(&stack.id, new_env.clone(), Some(reason))
+    .update_stack_partial(
+      &stack.id,
+      _PartialStackConfig {
+        environment: Some(new_env.clone()),
+        ..Default::default()
+      },
+      Some(reason),
+    )
     .await
     .context("UpdateStack failed")?;
   let update = find_env_update(ctx, &stack.id, t0).await?;
@@ -1197,6 +1221,282 @@ async fn edit_stack_env(
       bail!("verification failed: {msg}")
     }
   }
+}
+
+async fn edit_stack_command(
+  ctx: &Ctx<'_>,
+  args: &Value,
+) -> anyhow::Result<Value> {
+  const SECRET_REFUSAL: &str = "refused: command contains a literal secret; read it from the environment at runtime (e.g. ENVIRON in awk) or use a [[infisical://…]] interpolation";
+  let stack_key = arg_str(args, "stack")?;
+  let which = arg_str(args, "which")?;
+  let op = arg_str(args, "op")?;
+  let command = args
+    .get("command")
+    .and_then(Value::as_str)
+    .context("missing string argument `command`")?;
+  let reason = arg_str(args, "reason")?;
+  if reason.trim().is_empty() {
+    bail!("refused: reason is required");
+  }
+  if !matches!(which, "pre_deploy" | "post_deploy") {
+    bail!("refused: unknown command field");
+  }
+  if !matches!(op, "append" | "replace") {
+    bail!("refused: unknown command operation");
+  }
+  let dry_run = opt_bool(args, "dry_run", false);
+  let path = args.get("path").and_then(Value::as_str);
+  let if_fingerprint =
+    args.get("if_fingerprint").and_then(Value::as_str);
+
+  let stack = fetch_mutable(ctx, stack_key).await?;
+  let guard = ctx.env_locks.lock_for(&stack.id);
+  let _held = guard.lock().await;
+  let state = ctx.komodo.action_state(&stack.id).await?;
+  if state.deploying
+    || state.pulling
+    || state.destroying
+    || state.restarting
+  {
+    bail!("refused: stack busy; retry after the current operation");
+  }
+  ctx
+    .komodo
+    .refresh_cache(&stack.id, Some(reason))
+    .await
+    .context("RefreshStackCache failed")?;
+  let stack = ctx.komodo.get_stack(&stack.id).await?;
+  ctx.scrubber.learn_stack(&stack);
+  if ctx.scrubber.contains_secret(command) {
+    bail!(SECRET_REFUSAL);
+  }
+  let current = stack_command(&stack, which).clone();
+  if op == "replace" {
+    let wanted = if_fingerprint
+      .context("refused: if_fingerprint is required for replace")?;
+    if wanted != fingerprint(&current.command) {
+      bail!(
+        "conflict: if_fingerprint does not match the current command; nothing written"
+      );
+    }
+  }
+  if op == "append" && !current.command.is_empty() && path.is_some() {
+    bail!(
+      "refused: path may only be set when appending to an empty command or replacing"
+    );
+  }
+  let next_text = match op {
+    "append" if current.command.is_empty() => command.to_string(),
+    "append"
+      if command.is_empty()
+        || current.command.trim_end() == command
+        || current
+          .command
+          .trim_end()
+          .ends_with(&format!("\n{command}")) =>
+    {
+      current.command.clone()
+    }
+    "append" => format!("{}\n{command}", current.command.trim_end()),
+    "replace" => command.to_string(),
+    _ => unreachable!(),
+  };
+  let next = SystemCommand {
+    path: path.unwrap_or(&current.path).to_string(),
+    command: canonical_command(&next_text),
+    shell_mode: current.shell_mode,
+  };
+  let changed = next != current;
+  let summary = command_result(
+    &stack.name,
+    which,
+    &current,
+    &next,
+    (op == "append").then_some(command),
+    dry_run,
+    None,
+  );
+  if dry_run || !changed {
+    return Ok(summary);
+  }
+
+  let again = ctx.komodo.get_stack(&stack.id).await?;
+  if stack_command(&again, which) != &current {
+    bail!(
+      "conflict: command changed since it was read; nothing written, re-run"
+    );
+  }
+  let env_before = fingerprint(&stack.config.environment);
+  let rest_before = command_rest_fingerprint(&stack, which);
+  let partial = match which {
+    "pre_deploy" => _PartialStackConfig {
+      pre_deploy: Some(next.clone()),
+      ..Default::default()
+    },
+    "post_deploy" => _PartialStackConfig {
+      post_deploy: Some(next.clone()),
+      ..Default::default()
+    },
+    _ => unreachable!(),
+  };
+  let t0 = chrono_now_ms();
+  ctx
+    .komodo
+    .update_stack_partial(&stack.id, partial, Some(reason))
+    .await
+    .context("UpdateStack failed")?;
+  let update = find_env_update(ctx, &stack.id, t0).await?;
+  verify_command_write(
+    ctx,
+    &stack,
+    which,
+    &current,
+    &next,
+    &env_before,
+    &rest_before,
+    &update,
+  )
+  .await?;
+  Ok(command_result(
+    &stack.name,
+    which,
+    &current,
+    &next,
+    (op == "append").then_some(command),
+    false,
+    Some(&update.id),
+  ))
+}
+
+fn stack_command<'a>(
+  stack: &'a Stack,
+  which: &str,
+) -> &'a SystemCommand {
+  match which {
+    "pre_deploy" => &stack.config.pre_deploy,
+    "post_deploy" => &stack.config.post_deploy,
+    _ => unreachable!(),
+  }
+}
+
+fn canonical_command(command: &str) -> String {
+  let command = command.trim_end();
+  if command.is_empty() {
+    String::new()
+  } else {
+    format!("{command}\n")
+  }
+}
+
+fn command_rest_fingerprint(stack: &Stack, which: &str) -> String {
+  let mut value =
+    serde_json::to_value(&stack.config).unwrap_or(json!({}));
+  if let Some(config) = value.as_object_mut() {
+    config.remove(which);
+  }
+  fingerprint(&value.to_string())
+}
+
+fn command_summary(command: &str) -> Value {
+  json!({
+    "fingerprint": fingerprint(command),
+    "lines": command.lines().count(),
+  })
+}
+
+fn command_result(
+  stack: &str,
+  which: &str,
+  before: &SystemCommand,
+  after: &SystemCommand,
+  appended: Option<&str>,
+  dry_run: bool,
+  update_id: Option<&str>,
+) -> Value {
+  let changed = before != after;
+  let op = if appended.is_some() {
+    "append"
+  } else {
+    "replace"
+  };
+  let mut out = json!({
+    "stack": stack,
+    "which": which,
+    "op": op,
+    "changed": changed,
+    "dry_run": dry_run,
+    "path": after.path,
+    "shell_mode": after.shell_mode,
+    "diff": {
+      "before": command_summary(&before.command),
+      "after": command_summary(&after.command),
+      "appended_lines": if changed { appended.map_or(0, |command| command.lines().count()) } else { 0 },
+    },
+    "note": "check stack_history before deploying",
+  });
+  if let Some(appended) = appended {
+    out["appended"] = json!(appended);
+  }
+  if let Some(update_id) = update_id {
+    out["update_id"] = json!(update_id);
+  }
+  out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_command_write(
+  ctx: &Ctx<'_>,
+  stack: &Stack,
+  which: &str,
+  before: &SystemCommand,
+  after: &SystemCommand,
+  env_before: &str,
+  rest_before: &str,
+  update: &Update,
+) -> anyhow::Result<()> {
+  let previous = command_from_resource_toml(&update.prev_toml, which)
+    .context("error: concurrent writers; manual check needed")?;
+  if &previous != before {
+    bail!(
+      "error: concurrent writers; manual check needed (update {})",
+      update.id
+    );
+  }
+  let stored = ctx.komodo.get_stack(&stack.id).await?;
+  if stack_command(&stored, which) != after {
+    let got = stack_command(&stored, which);
+    bail!(
+      "verification failed: stored command does not equal the computed command (command {} != {}, path_match={}, shell_mode_match={})",
+      fingerprint(&got.command),
+      fingerprint(&after.command),
+      got.path == after.path,
+      got.shell_mode == after.shell_mode,
+    );
+  }
+  if fingerprint(&stored.config.environment) != env_before {
+    bail!("verification failed: environment fingerprint changed");
+  }
+  if command_rest_fingerprint(&stored, which) != rest_before {
+    bail!("verification failed: rest-of-config fingerprint changed");
+  }
+  Ok(())
+}
+
+fn command_from_resource_toml(
+  rendered: &str,
+  which: &str,
+) -> anyhow::Result<SystemCommand> {
+  let value: toml::Value = toml::from_str(rendered)?;
+  let command = value
+    .get("stack")
+    .and_then(toml::Value::as_array)
+    .and_then(|stacks| stacks.first())
+    .and_then(|stack| stack.get("config"))
+    .and_then(|config| config.get(which))
+    .cloned()
+    .unwrap_or_else(|| toml::Value::Table(Default::default()));
+  Ok(command.try_into()?)
 }
 
 fn chrono_now_ms() -> i64 {
@@ -1326,18 +1626,27 @@ fn export_env_toml(env: &str) -> String {
     .unwrap_or_default()
 }
 
-/// A resource export in Core's shape: `[[stack]]` then `[stack.config]`,
-/// with the env rendered by the same toml_pretty options Core uses.
 #[cfg(test)]
-pub(crate) fn export_env_resource_toml(
+pub(crate) fn export_stack_resource_toml(
   name: &str,
-  env: &str,
+  config: &komodo_client::entities::stack::StackConfig,
 ) -> String {
   let head = serde_json::json!({ "name": name });
-  let config = serde_json::json!({
-    "branch": "main",
-    "environment": env,
-  });
+  let mut projected = serde_json::Map::new();
+  projected.insert("branch".into(), json!(config.branch));
+  projected.insert("environment".into(), json!(config.environment));
+  if config.pre_deploy != SystemCommand::default() {
+    projected.insert(
+      "pre_deploy".into(),
+      serde_json::to_value(&config.pre_deploy).unwrap_or_default(),
+    );
+  }
+  if config.post_deploy != SystemCommand::default() {
+    projected.insert(
+      "post_deploy".into(),
+      serde_json::to_value(&config.post_deploy).unwrap_or_default(),
+    );
+  }
   let opts = toml_pretty_options();
   let mut out = String::from("[[stack]]\n");
   out.push_str(
@@ -1345,7 +1654,7 @@ pub(crate) fn export_env_resource_toml(
   );
   out.push_str("\n[stack.config]\n");
   out.push_str(
-    &toml_pretty::to_string(&config, opts).unwrap_or_default(),
+    &toml_pretty::to_string(&projected, opts).unwrap_or_default(),
   );
   out
 }
