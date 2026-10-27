@@ -1257,23 +1257,14 @@ async fn verify_env_write(
     .get_stack(&stack.id)
     .await
     .map_err(|e| VerifyFail::Mismatch(e.to_string()))?;
-  // Lost update first: Core's prev_toml env must be the buffer we spliced.
-  // Compared as text extracted from the export, never as a raw secret log.
-  // Only a trailing newline may differ. A fingerprint match is not enough:
-  // a concurrent edit of this key, a comment or an unparsed line must
-  // still be reported.
-  // Core writes prev_toml with toml_pretty 2.0.0, which emits a multiline
-  // string as `"""\n{val}"""` and does not escape backslashes. Extracting
-  // that does not return the bytes we sent. Render the spliced base the
-  // same way and compare the two extractions, so a `\` in a value is not
-  // reported as a race.
-  // Compare the assignment text, not extracted bytes. Core writes
-  // prev_toml with toml_pretty 2.0.0 as a multiline string and does not
-  // escape backslashes, so extraction is not a round trip. Rendering the
-  // spliced base with the same options produces the same assignment.
+  // Lost update first: compare Core's stored environment assignment to the
+  // same assignment rendered from the buffer we spliced. Assignment text is
+  // required because toml_pretty 2.0.0 does not escape multiline values, so
+  // parsing is not a round trip for backslashes. Both assignments being absent
+  // is valid when the base env is empty and Core skips the empty string.
   let prev_assign = environment_assignment(&update.prev_toml);
   let base_assign = environment_assignment(&export_env_toml(base));
-  if prev_assign.is_none() || prev_assign != base_assign {
+  if prev_assign != base_assign {
     return Err(VerifyFail::Lost {
       update_id: update.id.clone(),
     });
