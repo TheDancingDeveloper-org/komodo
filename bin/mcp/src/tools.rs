@@ -1268,14 +1268,18 @@ async fn edit_stack_command(
     .context("RefreshStackCache failed")?;
   let stack = ctx.komodo.get_stack(&stack.id).await?;
   ctx.scrubber.learn_stack(&stack);
-  if ctx.scrubber.contains_secret(command) {
+  if ctx.scrubber.contains_secret(command)
+    || path.is_some_and(|path| ctx.scrubber.contains_secret(path))
+  {
     bail!(SECRET_REFUSAL);
   }
   let current = stack_command(&stack, which).clone();
   if op == "replace" {
     let wanted = if_fingerprint
       .context("refused: if_fingerprint is required for replace")?;
-    if wanted != fingerprint(&current.command) {
+    if wanted != fingerprint(&current.command)
+      && !(current.command.is_empty() && wanted.is_empty())
+    {
       bail!(
         "conflict: if_fingerprint does not match the current command; nothing written"
       );
@@ -1455,12 +1459,19 @@ async fn verify_command_write(
   rest_before: &str,
   update: &Update,
 ) -> anyhow::Result<()> {
-  let previous = command_from_resource_toml(&update.prev_toml, which)
-    .context("error: concurrent writers; manual check needed")?;
-  if &previous != before {
+  let expected = if before == &SystemCommand::default() {
+    None
+  } else {
+    Some(rendered_command_assignment(which, before)?)
+  };
+  if !command_matches_prev(
+    &update.prev_toml,
+    which,
+    expected.as_deref(),
+  ) {
     bail!(
       "error: concurrent writers; manual check needed (update {})",
-      update.id
+      update.id,
     );
   }
   let stored = ctx.komodo.get_stack(&stack.id).await?;
@@ -1483,20 +1494,35 @@ async fn verify_command_write(
   Ok(())
 }
 
-fn command_from_resource_toml(
+fn rendered_command_assignment(
+  which: &str,
+  command: &SystemCommand,
+) -> anyhow::Result<String> {
+  let mut value = serde_json::Map::new();
+  value.insert(which.into(), json!(command));
+  toml_pretty::to_string(&value, toml_pretty_options())
+    .map_err(|_| anyhow!("unreadable prev_toml"))
+}
+
+/// Like-for-like check against Core's export. toml_pretty writes command
+/// objects as dotted keys (`pre_deploy.path = …`) under `[stack.config]`,
+/// and its multiline strings are not valid TOML, so this never parses.
+fn command_matches_prev(
   rendered: &str,
   which: &str,
-) -> anyhow::Result<SystemCommand> {
-  let value: toml::Value = toml::from_str(rendered)?;
-  let command = value
-    .get("stack")
-    .and_then(toml::Value::as_array)
-    .and_then(|stacks| stacks.first())
-    .and_then(|stack| stack.get("config"))
-    .and_then(|config| config.get(which))
-    .cloned()
-    .unwrap_or_else(|| toml::Value::Table(Default::default()));
-  Ok(command.try_into()?)
+  expected: Option<&str>,
+) -> bool {
+  match expected {
+    None => {
+      let prefix = format!("{which}.");
+      !rendered.lines().any(|line| line.starts_with(&prefix))
+    }
+    Some(expected) => {
+      let expected = expected.trim_end_matches('\n');
+      rendered.starts_with(expected)
+        || rendered.contains(&format!("\n{expected}"))
+    }
+  }
 }
 
 fn chrono_now_ms() -> i64 {
