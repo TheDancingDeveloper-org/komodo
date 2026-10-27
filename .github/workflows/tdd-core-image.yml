@@ -145,8 +145,10 @@ jobs:
           platforms: linux/amd64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
           provenance: false
+          # CARGO_BUILD_JOBS: OOM on aws-sdk-ec2; operator exception 2026-10-27.
           build-args: |
             KOMODO_VERSION=${{ steps.version.outputs.ui }}
+            CARGO_BUILD_JOBS=4
           tags: |
             ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical
             ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical-${{ github.sha }}
