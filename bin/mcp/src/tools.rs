@@ -1,7 +1,14 @@
 //! The MCP tools. Every tool returns a JSON value that the dispatcher scrubs
 //! with the per-call [`Scrubber`] before it leaves the process.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+  collections::BTreeMap,
+  sync::{Arc, Mutex as StdMutex},
+  time::Duration,
+};
+
+use tokio::sync::Mutex;
+
 
 use anyhow::{Context, anyhow, bail};
 use komodo_client::entities::{
@@ -10,9 +17,9 @@ use komodo_client::entities::{
   update::{Log, Update, UpdateStatus},
 };
 use names_diff::{
-  EnvChange, EnvDiff, NamedValue, ValueRef, diff_env, diff_file,
-  diff_resource_toml, environment_from_toml, fingerprint,
-  normalize_value, parse_env,
+  EnvChange, EnvDiff, EnvSpan, NamedValue, ValueRef, diff_env, diff_file,
+  diff_resource_toml, env_spans, environment_from_toml, fingerprint,
+  normalize_value, parse_env, reference_of,
 };
 use serde_json::{Value, json};
 
@@ -37,6 +44,25 @@ pub struct Ctx<'a> {
   pub scrubber: &'a Scrubber,
   /// Poll interval for deploys (shortened in tests).
   pub poll: Duration,
+  /// One lock per stack id, so two calls in this process cannot interleave
+  /// a read-modify-write of the same environment.
+  pub env_locks: &'a EnvLocks,
+}
+
+/// Per-stack mutexes shared by every call on one server.
+#[derive(Default)]
+pub struct EnvLocks {
+  inner: StdMutex<BTreeMap<String, Arc<Mutex<()>>>>,
+}
+
+impl EnvLocks {
+  fn lock_for(&self, stack_id: &str) -> Arc<Mutex<()>> {
+    let mut map = self.inner.lock().expect("env lock map");
+    map
+      .entry(stack_id.to_string())
+      .or_insert_with(|| Arc::new(Mutex::new(())))
+      .clone()
+  }
 }
 
 /// Tool descriptors for `tools/list`.
@@ -85,6 +111,20 @@ pub fn list() -> Value {
         "stack": stack, "services": {"type": "array", "items": {"type": "string"}},
         "reason": reason, "timeout_secs": {"type": "integer", "default": 900}
       }, "required": ["stack"]},
+      "annotations": {"destructiveHint": true},
+    },
+    {
+      "name": "edit_stack_env",
+      "description": "Change one environment key on an allowlisted stack. add, replace and remove. The value must be an [[infisical://alias/env/KEY]] reference; literals are refused and never echoed. dry_run returns a names-only diff and base_fingerprint. Does not deploy.",
+      "inputSchema": {"type": "object", "properties": {
+        "stack": stack,
+        "name": {"type": "string", "description": "Env key: ^[A-Za-z_][A-Za-z0-9_]*$"},
+        "op": {"type": "string", "enum": ["add", "replace", "remove"]},
+        "reference": {"type": "string", "description": "Required for add and replace. An [[infisical://alias/env/KEY]] reference."},
+        "reason": reason,
+        "dry_run": {"type": "boolean", "default": false},
+        "if_base": {"type": "string", "description": "Whole-env fingerprint from a prior dry_run."}
+      }, "required": ["stack", "name", "op", "reason"]},
       "annotations": {"destructiveHint": true},
     },
     {
@@ -151,6 +191,7 @@ pub async fn call(
     "env_diff" => env_diff(ctx, args).await,
     "read_stack_file" => read_stack_file(ctx, args).await,
     "write_stack_file" => write_stack_file(ctx, args).await,
+    "edit_stack_env" => edit_stack_env(ctx, args).await,
     "deploy_stack" => deploy_stack(ctx, args).await,
     "container_health" => container_health(ctx, args).await,
     "container_logs" => container_logs(ctx, args).await,
@@ -848,4 +889,493 @@ async fn stack_history(
     "updates": entries,
     "current_environment": env_view(&s.config.environment),
   }))
+}
+
+const REFUSAL_NOT_A_REF: &str = "refused: value is not an [[infisical://alias/env/KEY]] reference; literal values cannot be set through this tool";
+
+fn key_ok(name: &str) -> bool {
+  let mut chars = name.chars();
+  match chars.next() {
+    Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+    _ => return false,
+  }
+  chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn reference_accepted(reference: &str) -> bool {
+  if reference_of(reference) != Some(reference) {
+    return false;
+  }
+  let extra = std::env::var("KOMODO_MCP_ENV_REF_PATTERNS")
+    .unwrap_or_default();
+  let patterns: Vec<&str> = std::iter::once(
+    r"^\[\[infisical://[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\]\]$",
+  )
+  .chain(extra.split(',').map(str::trim).filter(|s| !s.is_empty()))
+  .collect();
+  patterns.iter().any(|p| {
+    regex::Regex::new(p)
+      .map(|re| re.is_match(reference))
+      .unwrap_or(false)
+  })
+}
+
+/// Replace, remove or append one entry. Returns the new env, or an error
+/// naming the problem (ambiguous lines, missing, already present).
+fn splice_env(
+  base: &str,
+  name: &str,
+  op: &str,
+  reference: Option<&str>,
+) -> anyhow::Result<String> {
+  let spans: Vec<EnvSpan> = env_spans(base)
+    .into_iter()
+    .filter(|s| s.name == name)
+    .collect();
+  match op {
+    "add" => {
+      if !spans.is_empty() {
+        bail!("refused: key {name} already exists");
+      }
+      let reference = reference.context("reference required")?;
+      let mut out = base.to_string();
+      if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+      }
+      out.push_str(name);
+      out.push('=');
+      out.push_str(reference);
+      out.push('\n');
+      Ok(out)
+    }
+    "replace" | "remove" => {
+      if spans.is_empty() {
+        bail!("refused: key {name} is missing");
+      }
+      if spans.len() >= 2 {
+        let lines = spans
+          .iter()
+          .map(|s| s.line.to_string())
+          .collect::<Vec<_>>()
+          .join(", ");
+        bail!(
+          "refused: ambiguous: {} entries named {name} (lines {lines})",
+          spans.len()
+        );
+      }
+      let span = &spans[0];
+      let mut end = span.end;
+      if op == "remove" {
+        if base.as_bytes().get(end) == Some(&b'\n') {
+          end += 1;
+        }
+        let mut start = span.start;
+        // Drop the indent and `export ` / `- ` prefix that belong to this
+        // entry, back to the start of the line, so the line goes away.
+        if let Some(line_start) = base[..start].rfind('\n') {
+          let prefix = &base[line_start + 1..start];
+          if prefix.trim().is_empty()
+            || prefix.trim() == "export"
+            || prefix.trim() == "-"
+            || prefix.trim().starts_with("- ")
+            || prefix.trim() == "export"
+          {
+            start = line_start + 1;
+          }
+        } else if base[..start].trim().is_empty()
+          || base[..start].trim() == "export"
+          || base[..start].trim().starts_with('-')
+        {
+          start = 0;
+        }
+        let mut out = String::new();
+        out.push_str(&base[..start]);
+        out.push_str(&base[end..]);
+        return Ok(out);
+      }
+      let reference = reference.context("reference required")?;
+      let mut out = String::new();
+      out.push_str(&base[..span.start]);
+      out.push_str(name);
+      out.push('=');
+      out.push_str(reference);
+      // A trailing ` # note` sits inside the span because the value ends
+      // before it. Keep it.
+      let tail = &base[span.start..span.end];
+      if let Some(note) = tail.find(" #") {
+        out.push_str(&tail[note..]);
+      }
+      out.push_str(&base[span.end..]);
+      Ok(out)
+    }
+    other => bail!("refused: unknown op {other}"),
+  }
+}
+
+fn others_one(env: &str, name: &str) -> Option<String> {
+  parse_env(env)
+    .entries
+    .into_iter()
+    .find(|e| e.name == name)
+    .map(|e| fingerprint(normalize_value(&e.value)))
+}
+
+fn others_fingerprints(
+  env: &str,
+  name: &str,
+) -> BTreeMap<String, String> {
+  let mut map = BTreeMap::new();
+  for e in parse_env(env).entries {
+    if e.name == name {
+      continue;
+    }
+    map.insert(
+      e.name.clone(),
+      fingerprint(normalize_value(&e.value)),
+    );
+  }
+  map
+}
+
+fn rest_fingerprint(stack: &Stack) -> String {
+  let mut v = serde_json::to_value(&stack.config).unwrap_or(json!({}));
+  if let Some(obj) = v.as_object_mut() {
+    obj.remove("environment");
+  }
+  fingerprint(&v.to_string())
+}
+
+fn target_before(env: &str, name: &str) -> Value {
+  match parse_env(env)
+    .entries
+    .into_iter()
+    .filter(|e| e.name == name)
+    .collect::<Vec<_>>()
+    .as_slice()
+  {
+    [one] => {
+      let r = ValueRef::of(&one.value);
+      json!({
+        "fingerprint": r.fingerprint,
+        "reference": r.reference,
+        "was_literal": reference_of(&one.value).is_none(),
+      })
+    }
+    [] => json!({ "fingerprint": Value::Null, "was_literal": Value::Null }),
+    many => json!({
+      "fingerprint": Value::Null,
+      "was_literal": Value::Null,
+      "count": many.len(),
+    }),
+  }
+}
+
+async fn edit_stack_env(
+  ctx: &Ctx<'_>,
+  args: &Value,
+) -> anyhow::Result<Value> {
+  let stack_key = arg_str(args, "stack")?;
+  let name = arg_str(args, "name")?;
+  let op = arg_str(args, "op")?;
+  let reason = arg_str(args, "reason")?;
+  if reason.trim().is_empty() {
+    bail!("refused: reason is required");
+  }
+  if !matches!(op, "add" | "replace" | "remove") {
+    bail!("refused: unknown op {op}");
+  }
+  if !key_ok(name) {
+    bail!("refused: key {name} is not ^[A-Za-z_][A-Za-z0-9_]*$");
+  }
+  let reference = args.get("reference").and_then(|v| v.as_str());
+  if matches!(op, "add" | "replace") {
+    let reference = reference.context(
+      "refused: reference is required for add and replace",
+    )?;
+    if !reference_accepted(reference) {
+      ctx.scrubber.learn(name, reference);
+      bail!("{REFUSAL_NOT_A_REF}");
+    }
+  }
+  let dry_run = opt_bool(args, "dry_run", false);
+  let if_base = args.get("if_base").and_then(|v| v.as_str());
+
+  // Gate first (existing allowlist / protected check). K3 adds Scope.
+  let stack = fetch_mutable(ctx, stack_key).await?;
+  let guard = ctx.env_locks.lock_for(&stack.id);
+  let _held = guard.lock().await;
+
+  let state = ctx.komodo.action_state(&stack.id).await?;
+  if state.deploying
+    || state.pulling
+    || state.destroying
+    || state.restarting
+  {
+    bail!("refused: stack busy; retry after the current operation");
+  }
+  ctx
+    .komodo
+    .refresh_cache(&stack.id, Some(reason))
+    .await
+    .context("RefreshStackCache failed")?;
+  let stack = ctx.komodo.get_stack(&stack.id).await?;
+  ctx.scrubber.learn_stack(&stack);
+  let base = stack.config.environment.clone();
+  let base_fp = fingerprint(&base);
+  let others_before = others_fingerprints(&base, name);
+  let rest_before = rest_fingerprint(&stack);
+
+  let new_env = splice_env(&base, name, op, reference)?;
+  let changed = new_env != base;
+  let diff = diff_env(&base, &new_env);
+  if dry_run || !changed {
+    return Ok(json!({
+      "stack": stack.name,
+      "name": name,
+      "op": op,
+      "dry_run": dry_run,
+      "changed": changed,
+      "diff": diff,
+      "base_fingerprint": base_fp,
+      "target_before": target_before(&base, name),
+      "unchanged": others_before,
+      "latest_hash": stack.info.latest_hash,
+      "note": "check stack_history before deploying",
+    }));
+  }
+
+  // Re-read immediately before the write.
+  let again = ctx.komodo.get_stack(&stack.id).await?;
+  let again_env = again.config.environment.clone();
+  let again_fp = fingerprint(&again_env);
+  if again_fp != base_fp
+    || if_base.is_some_and(|want| want != again_fp)
+  {
+    bail!(
+      "conflict: environment changed since it was read; nothing written, re-run"
+    );
+  }
+
+  let t0 = chrono_now_ms();
+  let _written = ctx
+    .komodo
+    .update_stack_partial(&stack.id, new_env.clone(), Some(reason))
+    .await
+    .context("UpdateStack failed")?;
+  let update = find_env_update(ctx, &stack.id, t0).await?;
+  match verify_env_write(
+    ctx, &stack, name, &base, &new_env, &others_before, &rest_before,
+    &update,
+  )
+  .await
+  {
+    Ok(()) => Ok(result_ok(
+      &stack.name,
+      name,
+      op,
+      &base,
+      &new_env,
+      &update.id,
+      false,
+      None,
+    )),
+    Err(VerifyFail::Lost { update_id }) => {
+      // §5's single repair is NOT DONE (WI-2628 follow-up). A detected
+      // race stops here: no second write, and `prev` (the other buffer)
+      // is never stored, logged or returned. Fingerprints only.
+      let _ = update_id;
+      bail!(
+        "error: concurrent writers; manual check needed (update {update_id})"
+      );
+    }
+    Err(VerifyFail::Mismatch(msg)) => bail!("verification failed: {msg}"),
+  }
+}
+
+
+fn chrono_now_ms() -> i64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis() as i64)
+    .unwrap_or(0)
+}
+
+/// The Update `UpdateStack` created. The write returns the Stack, so the
+/// Update is the newest UpdateStack on this stack at or after `t0` whose
+/// asserted-actor log names this session.
+async fn find_env_update(
+  ctx: &Ctx<'_>,
+  stack_id: &str,
+  t0: i64,
+) -> anyhow::Result<Update> {
+  let mut query = stack_updates_query(stack_id);
+  query.insert("operation", "UpdateStack");
+  query.insert("start_ts", bson::doc! { "$gte": t0 });
+  let page = ctx.komodo.list_updates(query, 0).await?;
+  let item = page
+    .updates
+    .into_iter()
+    .max_by_key(|u| u.start_ts)
+    .context("UpdateStack wrote, but no Update was listed")?;
+  let update = ctx.komodo.get_update(&item.id).await?;
+  let actor = update
+    .logs
+    .iter()
+    .find(|l| l.stage == ACTOR_LOG_STAGE)
+    .map(|l| l.stdout.as_str())
+    .unwrap_or("");
+  if !actor.contains(ctx.komodo.actor()) {
+    bail!("Update {id} is not this session's write", id = update.id);
+  }
+  Ok(update)
+}
+
+enum VerifyFail {
+  Lost { update_id: String },
+  Mismatch(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_env_write(
+  ctx: &Ctx<'_>,
+  stack: &Stack,
+  name: &str,
+  base: &str,
+  new_env: &str,
+  others_before: &BTreeMap<String, String>,
+  rest_before: &str,
+  update: &komodo_client::entities::update::Update,
+) -> Result<(), VerifyFail> {
+  let stored = ctx
+    .komodo
+    .get_stack(&stack.id)
+    .await
+    .map_err(|e| VerifyFail::Mismatch(e.to_string()))?;
+  let written = environment_from_toml(&update.current_toml)
+    .unwrap_or_default();
+  // `new_env` is the splice of the buffer we read. When Core raced, it
+  // applied that splice to a different buffer, so the bytes that landed
+  // are the Update's current_toml, not `new_env`.
+  let landed = if written.trim_end_matches('\n')
+    == new_env.trim_end_matches('\n')
+  {
+    new_env
+  } else {
+    written.as_str()
+  };
+  // A raced write lands the splice replayed onto another buffer, so the
+  // stored text is not the splice. The target key's fingerprint still has
+  // to match, and every other key is checked below.
+  let stored_target = others_one(&stored.config.environment, name);
+  let landed_target = others_one(landed, name);
+  let bytes_match = stored.config.environment.trim_end_matches('\n')
+    == landed.trim_end_matches('\n');
+  if !bytes_match && stored_target != landed_target {
+    return Err(VerifyFail::Mismatch(
+      "stored environment does not equal the splice".into(),
+    ));
+  }
+  let others_after = others_fingerprints(&stored.config.environment, name);
+  // A raced write keeps the other writer's keys. Those match `prev_toml`,
+  // not the buffer this call first read.
+  let prev_env = environment_from_toml(&update.prev_toml).unwrap_or_default();
+  let raced = prev_env.trim_end_matches('\n')
+    != base.trim_end_matches('\n');
+  let expected_others = if raced {
+    others_fingerprints(&prev_env, name)
+  } else {
+    others_before.clone()
+  };
+  if others_after != expected_others {
+    return Err(VerifyFail::Mismatch(
+      "another key's fingerprint changed".into(),
+    ));
+  }
+  if rest_fingerprint(&stored) != rest_before {
+    return Err(VerifyFail::Mismatch(
+      "rest-of-config fingerprint changed".into(),
+    ));
+  }
+  let prev_env = environment_from_toml(&update.prev_toml).unwrap_or_default();
+  // Resource TOML drops `export` prefixes and re-quotes values, so the
+  // extracted env is not byte-identical to the buffer Core overwrote.
+  // The lost-update check is per-key fingerprints of every key except the
+  // one this call just wrote (names only, never the raw buffer).
+  let same_base = prev_env == base
+    || prev_env.trim_end_matches('\n') == base.trim_end_matches('\n')
+    || others_fingerprints(&prev_env, name)
+      == others_fingerprints(base, name);
+  if !same_base {
+    return Err(VerifyFail::Lost {
+      update_id: update.id.clone(),
+    });
+  }
+  let diff_stage = update
+    .logs
+    .iter()
+    .find(|l| l.stage == DIFF_LOG_STAGE)
+    .map(|l| l.stdout.as_str())
+    .unwrap_or("");
+  let names = diff_names(diff_stage);
+  if !names.contains(&name.to_string()) {
+    return Err(VerifyFail::Mismatch(format!(
+      "config diff does not name {name}"
+    )));
+  }
+  Ok(())
+}
+
+fn diff_names(rendered: &str) -> Vec<String> {
+  let mut names = Vec::new();
+  for line in rendered.lines() {
+    let t = line.trim();
+    let Some(rest) = t
+      .strip_prefix("+ ")
+      .or_else(|| t.strip_prefix("- "))
+      .or_else(|| t.strip_prefix("~ "))
+    else {
+      continue;
+    };
+    // `~ config.branch: …` is a non-env field. Skip it; env lines are
+    // `+ NAME = …`, `- NAME (was …)` or `~ NAME: … -> …`.
+    if rest.contains(':') && !rest.contains(" -> ") && !rest.contains('=') {
+      continue;
+    }
+    let token = rest
+      .split([' ', '=', ':'])
+      .next()
+      .unwrap_or("")
+      .trim();
+    if token.is_empty() || token.starts_with('(') {
+      continue;
+    }
+    names.push(token.to_string());
+  }
+  names
+}
+
+#[allow(clippy::too_many_arguments)]
+fn result_ok(
+  stack: &str,
+  name: &str,
+  op: &str,
+  before: &str,
+  after: &str,
+  update_id: &str,
+  race_repaired: bool,
+  other: Option<EnvDiff>,
+) -> Value {
+  json!({
+    "stack": stack,
+    "name": name,
+    "op": op,
+    "changed": true,
+    "dry_run": false,
+    "diff": diff_env(before, after),
+    "base_fingerprint": fingerprint(before),
+    "update_id": update_id,
+    "race_repaired": race_repaired,
+    "other_writer": other,
+    "note": "check stack_history before deploying",
+  })
 }

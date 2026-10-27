@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     komodo,
     policy: config.policy,
     poll: Duration::from_secs(2),
+    env_locks: Default::default(),
   })
   .await
 }

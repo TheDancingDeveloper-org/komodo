@@ -18,6 +18,7 @@ An MCP server (stdio) for Komodo stacks. It is fork-only (TheDancingDeveloper) a
 | `read_stack_file(stack, path, refresh=true)` | read | Returns a compose/config file from Komodo's cache, refreshing the cache first. Known env values are scrubbed. `.env` files are refused. |
 | `write_stack_file(stack, path, content, reason?, dry_run?)` | **mutating** | Runs `RefreshStackCache` first and skips identical content. Then it writes and re-reads to verify. It refuses `.env` files. |
 | `deploy_stack(stack, services?, reason?, timeout_secs=900)` | **mutating** | Runs `DeployStack` and polls the Update until it completes. Returns pass/fail and the stages. On failure it adds the failing log tail (HTML stripped, scrubbed); on success it adds container health. |
+| `edit_stack_env(stack, name, op, reference?, reason, dry_run?, if_base?)` | **mutating** | Changes one env key (`add`, `replace` or `remove`). The value must be an `[[infisical://alias/env/KEY]]` reference; a literal is refused and never echoed. `dry_run` returns a names-only diff and `base_fingerprint`. It does not deploy. |
 | `container_health(stack)` | read | Per-service state and docker health. It never returns the inspect dump (env, labels). |
 | `container_logs(stack, service, tail=100)` | read | Tails one service's log, scrubbed. Maximum 1000 lines. |
 | `stack_history(stack, limit=15, since_last_successful_deploy?)` | read | Shows who changed what: user plus asserted actor, names-only config/env diffs, file-write fingerprints, and deploy results. |

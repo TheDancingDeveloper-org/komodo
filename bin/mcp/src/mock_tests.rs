@@ -81,8 +81,28 @@ struct Mock {
   stacks: Vec<Stack>,
   updates: HashMap<String, Update>,
   update_list: Vec<UpdateListItem>,
-  /// (endpoint, type, params, x-komodo-actor)
-  requests: Vec<(String, String, Value, Option<String>)>,
+  /// (endpoint, type, params, x-komodo-actor, x-komodo-reason)
+  #[allow(clippy::type_complexity)]
+  requests: Vec<(String, String, Value, Option<String>, Option<String>)>,
+  /// Next UpdateStack writes the stored env as this string instead of the
+  /// body that was sent. Consumed once. Used to fail verification.
+  store_instead: Option<String>,
+  /// Next UpdateStack reports this env as prev_toml (a lost update).
+  /// Consumed once.
+  race_prev: Option<String>,
+  /// Every UpdateStack reports this env as prev_toml. Not consumed, so a
+  /// repair write races too. After a write the next race appends `RACE=n`.
+  race_prev_always: Option<String>,
+  race_n: u64,
+  /// GetStack calls so far, used to apply mutate_on_get on a later read.
+  get_stack_calls: u64,
+  /// After this many GetStack calls (1 = the next one), replace the stored
+  /// env before returning. Consumed once.
+  mutate_on_get_after: u64,
+  /// After the next GetStack, replace the stored env before returning.
+  /// Consumed once. Simulates a writer between the two reads.
+  mutate_on_get: Option<String>,
+  update_seq: u64,
   pending_write: Option<(String, String, String)>,
   deploy_fails: bool,
   get_update_calls: usize,
@@ -150,6 +170,133 @@ fn list_item(s: &Stack) -> StackListItem {
   }
 }
 
+
+/// Replays the caller's edit onto the buffer Core overwrote.
+///
+/// A changed entry keeps the raced line's prefix (`export `, `- `) and
+/// takes the new value from the sent line. An added line is appended and
+/// a removed line is dropped. Matching is by key, so a TOML round trip
+/// that drops a prefix still replays onto the original line.
+fn apply_sent_over_prev(read: &str, sent: &str, prev: &str) -> String {
+  fn key_of(line: &str) -> Option<String> {
+    let t = line.trim().trim_start_matches("export ").trim_start_matches("- ");
+    let t = t.trim_start_matches('-').trim();
+    let (k, _) = t.split_once(['=', ':'])?;
+    let k = k.trim().trim_matches('"').trim_matches('\'');
+    if k.is_empty() { None } else { Some(k.to_string()) }
+  }
+  fn value_of(line: &str) -> String {
+    let t = line.trim().trim_start_matches("export ").trim_start_matches("- ");
+    let t = t.trim_start_matches('-').trim();
+    t.split_once(['=', ':']).map(|(_, v)| v.to_string()).unwrap_or_default()
+  }
+  let read_keys: Vec<Option<String>> = read.lines().map(key_of).collect();
+  let sent_lines: Vec<&str> = sent.lines().collect();
+  let sent_keys: Vec<Option<String>> = sent_lines.iter().copied().map(key_of).collect();
+  let mut prev_lines: Vec<String> = prev.lines().map(str::to_string).collect();
+  // Replace: same key, different value. Keep the raced line's prefix.
+  for (i, sk) in sent_keys.iter().enumerate() {
+    let Some(k) = sk else { continue };
+    let Some(ri) = read_keys.iter().position(|rk| rk.as_ref() == Some(k)) else {
+      continue;
+    };
+    if read.lines().nth(ri) == Some(sent_lines[i]) {
+      continue;
+    }
+    if let Some(pi) = prev_lines.iter().position(|l| key_of(l).as_ref() == Some(k)) {
+      let old = &prev_lines[pi];
+      let prefix_end = old.find(k).unwrap_or(0);
+      let mut rebuilt = old[..prefix_end].to_string();
+      rebuilt.push_str(k);
+      rebuilt.push('=');
+      let v = value_of(sent_lines[i]);
+      rebuilt.push_str(v.trim());
+      // Keep a trailing note that lived on the raced line.
+      if let Some(note) = old.find(" #") {
+        rebuilt.push_str(&old[note..]);
+      }
+      prev_lines[pi] = rebuilt;
+    }
+  }
+  // Add: a sent key the read did not have.
+  for (i, sk) in sent_keys.iter().enumerate() {
+    let Some(k) = sk else { continue };
+    if read_keys.iter().any(|rk| rk.as_ref() == Some(k)) {
+      continue;
+    }
+    if prev_lines.iter().any(|l| key_of(l).as_ref() == Some(k)) {
+      continue;
+    }
+    prev_lines.push(sent_lines[i].to_string());
+  }
+  // Remove: a read key the sent body dropped.
+  for rk in &read_keys {
+    let Some(k) = rk else { continue };
+    if sent_keys.iter().any(|sk| sk.as_ref() == Some(k)) {
+      continue;
+    }
+    if let Some(pi) = prev_lines.iter().position(|l| key_of(l).as_ref() == Some(k)) {
+      prev_lines.remove(pi);
+    }
+  }
+  let mut out = prev_lines.join("\n");
+  if (prev.ends_with('\n') || sent.ends_with('\n')) && !out.ends_with('\n') {
+    out.push('\n');
+  }
+  out
+}
+
+#[allow(dead_code)]
+fn apply_sent_over_prev_by_line(read: &str, sent: &str, prev: &str) -> String {
+  let read_lines: Vec<&str> = read.lines().collect();
+  let sent_lines: Vec<&str> = sent.lines().collect();
+  let mut prev_lines: Vec<String> =
+    prev.lines().map(str::to_string).collect();
+  let mut i = 0;
+  let mut j = 0;
+  while i < read_lines.len() && j < sent_lines.len() {
+    if read_lines[i] == sent_lines[j] {
+      i += 1;
+      j += 1;
+      continue;
+    }
+    let read_later = read_lines[i + 1..].contains(&sent_lines[j]);
+    let sent_later = sent_lines[j + 1..].contains(&read_lines[i]);
+    if sent_later && !read_later {
+      prev_lines.insert(i.min(prev_lines.len()), sent_lines[j].to_string());
+      j += 1;
+      continue;
+    }
+    if read_later && !sent_later {
+      if i < prev_lines.len() {
+        prev_lines.remove(i);
+      }
+      i += 1;
+      continue;
+    }
+    if i < prev_lines.len() {
+      prev_lines[i] = sent_lines[j].to_string();
+    }
+    i += 1;
+    j += 1;
+  }
+  while j < sent_lines.len() {
+    prev_lines.push(sent_lines[j].to_string());
+    j += 1;
+  }
+  while i < read_lines.len() {
+    if i < prev_lines.len() {
+      prev_lines.remove(i);
+    }
+    i += 1;
+  }
+  let mut out = prev_lines.join("\n");
+  if prev.ends_with('\n') || sent.ends_with('\n') {
+    out.push('\n');
+  }
+  out
+}
+
 fn update_item(u: &Update) -> UpdateListItem {
   UpdateListItem {
     id: u.id.clone(),
@@ -191,7 +338,7 @@ fn new_mock() -> Shared {
   let prod = stack_fixture(PROD_ID, "vogt-prod", &prod_env);
   let toml_with = |env: &str| {
     format!(
-      "[[stack]]\nname = \"vogt-dev\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\n{env}\n\"\"\"\n"
+      "[[stack]]\nname = \"vogt-dev\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\n{env}\"\"\"\n"
     )
   };
   let config_update = Update {
@@ -328,6 +475,21 @@ fn matches_query(u: &UpdateListItem, q: &bson::Document) -> bool {
   true
 }
 
+
+fn key_names(env: &str) -> std::collections::BTreeSet<String> {
+  names_diff::parse_env(env)
+    .entries
+    .into_iter()
+    .map(|e| e.name)
+    .collect()
+}
+
+fn env_resource_toml(name: &str, env: &str) -> String {
+  format!(
+    "[[stack]]\nname = \"{name}\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\n{env}\"\"\"\n"
+  )
+}
+
 async fn handle(
   State(state): State<Shared>,
   Path(endpoint): Path<String>,
@@ -340,12 +502,17 @@ async fn handle(
     .get("x-komodo-actor")
     .and_then(|v| v.to_str().ok())
     .map(String::from);
+  let reason = headers
+    .get("x-komodo-reason")
+    .and_then(|v| v.to_str().ok())
+    .map(String::from);
   let mut m = state.lock().unwrap();
   m.requests.push((
     endpoint.clone(),
     ty.clone(),
     params.clone(),
     actor,
+    reason.clone(),
   ));
   // Every request must deserialize into Komodo's own request type: this is
   // the body-shape check.
@@ -363,6 +530,18 @@ async fn handle(
     }
     ("read", "GetStack") => {
       let p = parse!(GetStack);
+      m.get_stack_calls += 1;
+      let due = m.mutate_on_get_after == 0
+        || m.get_stack_calls >= m.mutate_on_get_after;
+      if due
+        && let Some(env) = m.mutate_on_get.take()
+        && let Some(s) = m
+          .stacks
+          .iter_mut()
+          .find(|s| s.id == p.stack || s.name == p.stack)
+      {
+        s.config.environment = env;
+      }
       json!(find(&m, &p.stack).ok_or_else(|| err("no stack"))?)
     }
     ("read", "GetStackActionState") => {
@@ -495,6 +674,102 @@ async fn handle(
         ..Default::default()
       })
     }
+    ("write", "UpdateStack") => {
+      let p = parse!(komodo_client::api::write::UpdateStack);
+      let sent = p.config.environment.clone().unwrap_or_default();
+      let idx = m
+        .stacks
+        .iter()
+        .position(|s| s.id == p.id || s.name == p.id)
+        .ok_or_else(|| err("no stack"))?;
+      let before = m.stacks[idx].config.environment.clone();
+      let raced = if m.race_prev_always.is_some() {
+        m.race_n += 1;
+        if m.race_n > 1 {
+          let n = m.race_n;
+          if let Some(buf) = m.race_prev_always.as_mut() {
+            buf.push_str(&format!("RACE={n}\n"));
+          }
+        }
+        m.race_prev_always.clone()
+      } else {
+        m.race_prev.clone()
+      };
+      // A repair sends the buffer it just read, which already contains the
+      // raced lines. That write is not a second lost update unless the
+      // raced buffer has moved again (a new line the repair never saw).
+      // A repair's sent body is the raced buffer with one key spliced, so
+      // it still contains every line of that buffer. A later race appends
+      // a line the repair never saw, and is not a repair.
+      // Key names only. A repair's body still names every key of the raced
+      // buffer (the spliced key included). A later race adds a key name
+      // the repair never sent.
+      let repair_of_race = raced.as_ref().is_some_and(|r| {
+        let sent_keys = key_names(&sent);
+        let rk = key_names(r);
+        rk.is_subset(&sent_keys)
+      });
+            if repair_of_race {
+        m.race_prev = None;
+      }
+      let prev = if repair_of_race {
+        before.clone()
+      } else {
+        raced.clone().unwrap_or_else(|| before.clone())
+      };
+      // Stored bytes are the caller's edit replayed onto the buffer Core
+      // overwrote, unless a test forces them.
+      let stored = m.store_instead.take().unwrap_or_else(|| {
+        if prev == before {
+          // The caller already spliced this buffer. Storing `sent` is
+          // what Core does: the body is the new field value.
+          sent.clone()
+        } else {
+          // A repair still names the raced keys, but Core stores the
+          // sent body as the new field, not a replay. Replaying here is
+          // what makes the Update's names-only diff show the one key
+          // this call changed against the buffer it overwrote.
+          apply_sent_over_prev(&before, &sent, &prev)
+        }
+      });
+            m.stacks[idx].config.environment = stored.clone();
+      m.update_seq += 1;
+      let id = format!("cccccccccccccccccccc{:04x}", m.update_seq);
+      let stack_id = m.stacks[idx].id.clone();
+      let name = m.stacks[idx].name.clone();
+      let prev_toml = env_resource_toml(&name, &prev);
+      let current_toml = env_resource_toml(&name, &stored);
+      let diff = names_diff::diff_resource_toml(&prev_toml, &current_toml)
+        .map(|d| d.render())
+        .unwrap_or_else(|e| format!("diff failed: {e}"));
+
+      let reason_text = reason.clone().unwrap_or_default();
+      let update = Update {
+        id: id.clone(),
+        operation: Operation::UpdateStack,
+        start_ts: 20_000 + m.update_seq as i64,
+        success: true,
+        status: UpdateStatus::Complete,
+        operator: "user-1".into(),
+        target: ResourceTarget::Stack(stack_id),
+        prev_toml,
+        current_toml,
+        logs: vec![
+          log(
+            "Actor (asserted)",
+            &format!("actor: vogt-session:test\nreason: {reason_text}"),
+            "",
+            true,
+          ),
+          log("Config diff (names only)", &diff, "", true),
+        ],
+        ..Default::default()
+      };
+      m.updates.insert(id, update.clone());
+      m.update_list.insert(0, update_item(&update));
+      // UpdateStack's response is the Stack, not the Update.
+      json!(m.stacks[idx].clone())
+    }
     ("execute", "DeployStack") => {
       let _ = parse!(DeployStack);
       m.get_update_calls = 0;
@@ -533,6 +808,7 @@ async fn start(policy: Policy) -> (Server, Shared) {
     komodo: Komodo::new(&config),
     policy,
     poll: Duration::from_millis(10),
+    env_locks: Default::default(),
   };
   (server, state)
 }
@@ -967,7 +1243,7 @@ async fn errors_are_scrubbed_and_protocol_works() {
     .iter()
     .map(|t| t["name"].as_str().unwrap())
     .collect();
-  assert_eq!(names.len(), 9);
+  assert_eq!(names.len(), 10);
   assert!(server.handle(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await.is_none());
   let unknown = server
     .handle(json!({"jsonrpc": "2.0", "id": 3, "method": "x"}))
@@ -979,4 +1255,409 @@ async fn errors_are_scrubbed_and_protocol_works() {
     .await
     .unwrap();
   assert_clean(&call);
+}
+
+const REF: &str = "[[infisical://infrastructure/prod/SOME_KEY]]";
+
+fn rich_env() -> String {
+  // Six parsed keys, plus a comment, an export prefix, a quoted multi-line
+  // value and a line parse_env cannot keep.
+  "\
+# keep this comment
+ALPHA=one
+export BETA=two
+GAMMA=\"line-a
+line-b\"
+DELTA=four # trailing note
+- EPSILON=five
+ZETA=six
+this line is not a pair
+"
+  .to_string()
+}
+
+fn set_dev_env(state: &Shared, env: &str) {
+  let mut m = state.lock().unwrap();
+  m.stacks
+    .iter_mut()
+    .find(|s| s.name == "vogt-dev")
+    .unwrap()
+    .config
+    .environment = env.to_string();
+}
+
+fn dev_env(state: &Shared) -> String {
+  state
+    .lock()
+    .unwrap()
+    .stacks
+    .iter()
+    .find(|s| s.name == "vogt-dev")
+    .unwrap()
+    .config
+    .environment
+    .clone()
+}
+
+fn update_stack_count(state: &Shared) -> usize {
+  state
+    .lock()
+    .unwrap()
+    .requests
+    .iter()
+    .filter(|r| r.1 == "UpdateStack")
+    .count()
+}
+
+fn reasons(state: &Shared) -> Vec<Option<String>> {
+  state
+    .lock()
+    .unwrap()
+    .requests
+    .iter()
+    .filter(|r| r.1 == "UpdateStack")
+    .map(|r| r.4.clone())
+    .collect()
+}
+
+fn call_env(
+  server: &Server,
+  extra: serde_json::Value,
+) -> impl std::future::Future<Output = Value> + '_ {
+  let mut args = json!({
+    "stack": "vogt-dev",
+    "name": "BETA",
+    "op": "replace",
+    "reference": REF,
+    "reason": "rotate one key",
+  });
+  if let (Some(obj), Some(more)) =
+    (args.as_object_mut(), extra.as_object())
+  {
+    for (k, v) in more {
+      obj.insert(k.clone(), v.clone());
+    }
+  }
+  async move { server.call_tool("edit_stack_env", &args).await }
+}
+
+/// Test 1: one key changes; every other byte and the rest of the config stay.
+#[tokio::test]
+async fn edit_env_one_key_others_byte_identical() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let before = rich_env();
+  set_dev_env(&state, &before);
+  let rest_before = {
+    let m = state.lock().unwrap();
+    let s = m.stacks.iter().find(|s| s.name == "vogt-dev").unwrap();
+    let mut v = serde_json::to_value(&s.config).unwrap();
+    v.as_object_mut().unwrap().remove("environment");
+    names_diff::fingerprint(&v.to_string())
+  };
+  let res = call_env(&server, json!({})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let v = text_of(&res);
+  assert_clean(&v);
+  let text = res["content"][0]["text"].as_str().unwrap();
+  assert!(!text.contains("two"));
+  assert!(!text.contains("line-a"));
+  let after = dev_env(&state);
+  let spans = names_diff::env_spans(&before);
+  let beta = spans.iter().find(|s| s.name == "BETA").unwrap();
+  let mut expect = String::new();
+  expect.push_str(&before[..beta.start]);
+  expect.push_str("BETA=");
+  expect.push_str(REF);
+  expect.push_str(&before[beta.end..]);
+  assert_eq!(after, expect, "splice was not byte-identical outside BETA");
+  assert!(after.contains("# keep this comment"));
+  assert!(after.contains("this line is not a pair"));
+  assert!(after.contains("line-a\nline-b"));
+  let others_before = names_diff::parse_env(&before)
+    .entries
+    .into_iter()
+    .filter(|e| e.name != "BETA")
+    .map(|e| (e.name, names_diff::fingerprint(&e.value)))
+    .collect::<Vec<_>>();
+  let others_after = names_diff::parse_env(&after)
+    .entries
+    .into_iter()
+    .filter(|e| e.name != "BETA")
+    .map(|e| (e.name, names_diff::fingerprint(&e.value)))
+    .collect::<Vec<_>>();
+  assert_eq!(others_before, others_after);
+  let rest_after = {
+    let m = state.lock().unwrap();
+    let s = m.stacks.iter().find(|s| s.name == "vogt-dev").unwrap();
+    let mut v = serde_json::to_value(&s.config).unwrap();
+    v.as_object_mut().unwrap().remove("environment");
+    names_diff::fingerprint(&v.to_string())
+  };
+  assert_eq!(rest_before, rest_after);
+  assert_eq!(v["changed"], true);
+  assert_eq!(v["diff"]["changed"][0]["name"], "BETA");
+  assert_eq!(update_stack_count(&state), 1);
+  assert!(types(&state).iter().all(|t| t != "DeployStack"));
+}
+
+/// Test 2: a non-reference is refused, not echoed, and nothing is written.
+#[tokio::test]
+async fn edit_env_refuses_literals_without_echo() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let before = dev_env(&state);
+  let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+  let bad = [
+    "abc",
+    &format!("\"{REF}\""),
+    &format!("{REF}x"),
+    "[[MY_VAR]]",
+    token,
+  ];
+  for input in bad {
+    let res = call_env(
+      &server,
+      json!({"reference": input, "name": "NEWK", "op": "add"}),
+    )
+    .await;
+    assert_eq!(res["isError"], true, "{input}: {res}");
+    let text = res["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("literal values cannot be set"));
+    assert!(!text.contains(input), "echoed input in {text}");
+    if input == token {
+      assert!(!text.contains("ghp_"));
+    }
+  }
+  assert_eq!(dev_env(&state), before);
+  assert_eq!(update_stack_count(&state), 0);
+}
+
+/// Test 6: the reason header is required and reaches Core.
+#[tokio::test]
+async fn edit_env_reason_is_required_and_stamped() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, &rich_env());
+  let missing = server
+    .call_tool(
+      "edit_stack_env",
+      &json!({
+        "stack": "vogt-dev",
+        "name": "BETA",
+        "op": "replace",
+        "reference": REF,
+      }),
+    )
+    .await;
+  assert_eq!(missing["isError"], true);
+  let text = missing["content"][0]["text"].as_str().unwrap();
+  assert!(text.contains("missing string argument `reason`"));
+  assert_eq!(update_stack_count(&state), 0);
+
+  let res = call_env(&server, json!({"reason": "because the design says so"})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  assert_eq!(
+    reasons(&state),
+    vec![Some("because the design says so".into())]
+  );
+}
+
+/// Test 7: dry_run returns the names-only diff and writes nothing.
+#[tokio::test]
+async fn edit_env_dry_run_does_not_write() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let before = rich_env();
+  set_dev_env(&state, &before);
+  let res = call_env(&server, json!({"dry_run": true})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let v = text_of(&res);
+  assert_eq!(v["dry_run"], true);
+  assert_eq!(v["changed"], true);
+  assert_eq!(v["diff"]["changed"][0]["name"], "BETA");
+  assert!(v["base_fingerprint"].as_str().unwrap().starts_with("sha256:"));
+  assert_eq!(dev_env(&state), before);
+  assert_eq!(update_stack_count(&state), 0);
+}
+
+/// Test 8: missing, duplicate and already-present keys are specific errors.
+#[tokio::test]
+async fn edit_env_key_errors_are_specific() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "A=1\nB=2\nA=3\n");
+  let missing = call_env(
+    &server,
+    json!({"name": "NOPE", "op": "replace"}),
+  )
+  .await;
+  assert!(
+    text_of_err(&missing).contains("key NOPE is missing"),
+    "{missing}"
+  );
+  let ambiguous = call_env(
+    &server,
+    json!({"name": "A", "op": "replace"}),
+  )
+  .await;
+  let msg = text_of_err(&ambiguous);
+  assert!(msg.contains("ambiguous: 2 entries named A"), "{msg}");
+  let exists = call_env(
+    &server,
+    json!({"name": "B", "op": "add"}),
+  )
+  .await;
+  assert!(text_of_err(&exists).contains("key B already exists"), "{exists}");
+  assert_eq!(update_stack_count(&state), 0);
+}
+
+fn text_of_err(result: &Value) -> String {
+  text_of(result)["error"].as_str().unwrap().to_string()
+}
+
+/// Test 9: a change between the two reads is a conflict and writes nothing.
+#[tokio::test]
+async fn edit_env_conflict_when_env_moves_before_write() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, &rich_env());
+  // The first GetStack returns the fixture. The re-check GetStack then
+  // observes another writer. Refresh does not call GetStack, so the
+  // second GetStack is the re-check.
+  {
+    let mut m = state.lock().unwrap();
+    m.mutate_on_get = Some("ALPHA=changed\n".into());
+    // fetch_mutable already consumed GetStack #1. The post-refresh
+    // read is #2; the re-check is #3.
+    m.mutate_on_get_after = 3;
+  }
+  let res = call_env(&server, json!({})).await;
+  assert_eq!(res["isError"], true, "{res}");
+  assert!(text_of_err(&res).contains("conflict"));
+  assert_eq!(update_stack_count(&state), 0);
+  assert_eq!(dev_env(&state), "ALPHA=changed\n");
+}
+
+/// §5 single repair is NOT DONE. A detected lost update is refused and
+/// no second write is sent. The first UpdateStack has already landed
+/// (Core applied it); this call does not try to repair it.
+#[tokio::test]
+async fn edit_env_lost_update_is_refused() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let before = rich_env();
+  set_dev_env(&state, &before);
+  let raced = format!("{before}OMEGA=kept\n");
+  state.lock().unwrap().race_prev = Some(raced);
+  let res = call_env(&server, json!({})).await;
+  assert_eq!(res["isError"], true, "{res}");
+  let msg = text_of_err(&res);
+  assert!(msg.contains("concurrent writers"), "{msg}");
+  assert_eq!(update_stack_count(&state), 1);
+}
+
+#[tokio::test]
+async fn edit_env_second_race_stops() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let before = rich_env();
+  set_dev_env(&state, &before);
+  state.lock().unwrap().race_prev_always = Some(format!("{before}OTHER=1\n"));
+  let res = call_env(&server, json!({})).await;
+  assert_eq!(res["isError"], true, "{res}");
+  let msg = text_of_err(&res);
+  assert!(msg.contains("concurrent writers"), "{msg}");
+  // Each attempt sees a fresh race and stops. No repair write.
+  assert_eq!(update_stack_count(&state), 1);
+}
+
+/// Test 11: stored env that is not the splice fails verification.
+#[tokio::test]
+async fn edit_env_verification_mismatch() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, &rich_env());
+  state.lock().unwrap().store_instead = Some("NOT=the-splice\n".into());
+  let res = call_env(&server, json!({})).await;
+  assert_eq!(res["isError"], true, "{res}");
+  let msg = text_of_err(&res);
+  assert!(msg.contains("verification failed"), "{msg}");
+  assert_eq!(update_stack_count(&state), 1);
+  assert!(types(&state).iter().all(|t| t != "DeployStack"));
+}
+
+/// Env half of test 17: add the sccache reference; do not deploy.
+#[tokio::test]
+async fn edit_env_adds_sccache_reference_without_deploy() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "PLAIN=1\n");
+  {
+    let mut m = state.lock().unwrap();
+    let s = m.stacks.iter_mut().find(|s| s.name == "vogt-dev").unwrap();
+    s.config.pre_deploy = komodo_client::entities::SystemCommand {
+      path: "sh".into(),
+      command: "set -e\necho one\necho two".into(),
+      shell_mode: false,
+    };
+  }
+  let reference =
+    "[[infisical://infrastructure/prod/SCCACHE_DIST_CLIENT_TOKEN]]";
+  let res = server
+    .call_tool(
+      "edit_stack_env",
+      &json!({
+        "stack": "vogt-dev",
+        "name": "SCCACHE_DIST_CLIENT_TOKEN",
+        "op": "add",
+        "reference": reference,
+        "reason": "L3 env half",
+      }),
+    )
+    .await;
+  assert_eq!(res["isError"], false, "{res}");
+  let stored = dev_env(&state);
+  assert!(stored.contains(&format!("SCCACHE_DIST_CLIENT_TOKEN={reference}")));
+  assert!(stored.starts_with("PLAIN=1\n"));
+  assert!(types(&state).iter().all(|t| t != "DeployStack"));
+  let m = state.lock().unwrap();
+  let s = m.stacks.iter().find(|s| s.name == "vogt-dev").unwrap();
+  assert_eq!(
+    s.config.pre_deploy.command,
+    "set -e\necho one\necho two"
+  );
+}
+
+/// Protected stacks stay refused by the existing gate.
+#[tokio::test]
+async fn edit_env_protected_stack_still_refused() {
+  let (server, state) = start(policy("vogt-*", "")).await;
+  let before = {
+    let m = state.lock().unwrap();
+    m.stacks
+      .iter()
+      .find(|s| s.name == "vogt-prod")
+      .unwrap()
+      .config
+      .environment
+      .clone()
+  };
+  // prod matches *prod* and is not opted in.
+  let res = server
+    .call_tool(
+      "edit_stack_env",
+      &json!({
+        "stack": "vogt-prod",
+        "name": "PLAIN",
+        "op": "replace",
+        "reference": REF,
+        "reason": "should not",
+      }),
+    )
+    .await;
+  assert_eq!(res["isError"], true);
+  assert!(text_of_err(&res).contains("protected"));
+  let after = {
+    let m = state.lock().unwrap();
+    m.stacks
+      .iter()
+      .find(|s| s.name == "vogt-prod")
+      .unwrap()
+      .config
+      .environment
+      .clone()
+  };
+  assert_eq!(after, before);
+  assert_eq!(update_stack_count(&state), 0);
 }

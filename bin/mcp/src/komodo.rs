@@ -14,11 +14,14 @@ use komodo_client::{
       InspectStackContainer, ListStackServices, ListStacks,
       ListUpdates, ListUpdatesResponse,
     },
-    write::{RefreshStackCache, WriteStackFileContents},
+    write::{RefreshStackCache, UpdateStack, WriteStackFileContents},
   },
   entities::{
     docker::container::Container,
-    stack::{Stack, StackActionState, StackListItem, StackService},
+    stack::{
+      Stack, StackActionState, StackListItem, StackService,
+      _PartialStackConfig,
+    },
     update::{Log, Update, UpdateStatus},
   },
 };
@@ -47,6 +50,10 @@ fn http(headers: HeaderMap) -> reqwest::Client {
 }
 
 impl Komodo {
+  pub fn actor(&self) -> &str {
+    &self.actor
+  }
+
   pub fn new(config: &Config) -> Komodo {
     let client =
       KomodoClient::new(&config.url, &config.key, &config.secret)
@@ -120,6 +127,26 @@ impl Komodo {
       })
       .await
       .map(|_| ())
+  }
+
+  /// `UpdateStack` with only `environment` set. Other config fields stay
+  /// `None` and are omitted (`skip_serializing_none` on `_PartialStackConfig`).
+  pub async fn update_stack_partial(
+    &self,
+    id: &str,
+    environment: String,
+    reason: Option<&str>,
+  ) -> anyhow::Result<Stack> {
+    self
+      .stamped(reason)
+      .write(UpdateStack {
+        id: id.to_string(),
+        config: _PartialStackConfig {
+          environment: Some(environment),
+          ..Default::default()
+        },
+      })
+      .await
   }
 
   pub async fn write_file(
@@ -293,14 +320,27 @@ mod tests {
       envelope(GetUpdate { id: "u".into() }),
       json!({"type": "GetUpdate", "params": {"id": "u"}})
     );
-    // The trap from the incident log: UpdateStack takes `id`, not `stack`.
-    // This server never sends UpdateStack, but pin the shape so a future
-    // tool cannot get it wrong.
+    // UpdateStack takes `id`, not `stack`. A partial env edit sends only
+    // `config.environment`; every other config key stays absent.
     let v = envelope(UpdateStack {
       id: "s".into(),
-      config: Default::default(),
+      config: _PartialStackConfig {
+        environment: Some("K=[[infisical://a/b/C]]".into()),
+        ..Default::default()
+      },
     });
-    assert!(v["params"].get("id").is_some());
+    assert_eq!(
+      v,
+      json!({
+        "type": "UpdateStack",
+        "params": {
+          "id": "s",
+          "config": { "environment": "K=[[infisical://a/b/C]]" }
+        }
+      })
+    );
+    let config = v["params"]["config"].as_object().unwrap();
+    assert_eq!(config.keys().collect::<Vec<_>>(), ["environment"]);
     assert!(v["params"].get("stack").is_none());
     // GetStack also accepts `id`/`name` aliases on the server side.
     let parsed: GetStack =
