@@ -9,7 +9,6 @@ use std::{
 
 use tokio::sync::Mutex;
 
-
 use anyhow::{Context, anyhow, bail};
 use komodo_client::entities::{
   Operation,
@@ -17,9 +16,9 @@ use komodo_client::entities::{
   update::{Log, Update, UpdateStatus},
 };
 use names_diff::{
-  EnvChange, EnvDiff, EnvSpan, NamedValue, ValueRef, diff_env, diff_file,
-  diff_resource_toml, env_spans, environment_from_toml, fingerprint,
-  normalize_value, parse_env, reference_of,
+  EnvChange, EnvDiff, EnvSpan, NamedValue, ValueRef, diff_env,
+  diff_file, diff_resource_toml, env_spans, environment_from_toml,
+  fingerprint, normalize_value, parse_env, reference_of,
 };
 use serde_json::{Value, json};
 
@@ -906,8 +905,8 @@ fn reference_accepted(reference: &str) -> bool {
   if reference_of(reference) != Some(reference) {
     return false;
   }
-  let extra = std::env::var("KOMODO_MCP_ENV_REF_PATTERNS")
-    .unwrap_or_default();
+  let extra =
+    std::env::var("KOMODO_MCP_ENV_REF_PATTERNS").unwrap_or_default();
   let patterns: Vec<&str> = std::iter::once(
     r"^\[\[infisical://[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\]\]$",
   )
@@ -978,7 +977,6 @@ fn splice_env(
             || prefix.trim() == "export"
             || prefix.trim() == "-"
             || prefix.trim().starts_with("- ")
-            || prefix.trim() == "export"
           {
             start = line_start + 1;
           }
@@ -999,25 +997,21 @@ fn splice_env(
       out.push_str(name);
       out.push('=');
       out.push_str(reference);
-      // A trailing ` # note` sits inside the span because the value ends
-      // before it. Keep it.
-      let tail = &base[span.start..span.end];
-      if let Some(note) = tail.find(" #") {
-        out.push_str(&tail[note..]);
+      // Keep a comment that begins after the parsed value. A `#` inside
+      // quotes is part of the value (`PW="abc #s3cret more"`), so it is
+      // never kept. Only an unquoted trailing ` #…` is a comment.
+      let line = &base[span.start..span.end];
+      if !span.value.starts_with('"')
+        && !span.value.starts_with('\'')
+        && let Some(at) = line.find(" #")
+      {
+        out.push_str(&line[at..]);
       }
       out.push_str(&base[span.end..]);
       Ok(out)
     }
     other => bail!("refused: unknown op {other}"),
   }
-}
-
-fn others_one(env: &str, name: &str) -> Option<String> {
-  parse_env(env)
-    .entries
-    .into_iter()
-    .find(|e| e.name == name)
-    .map(|e| fingerprint(normalize_value(&e.value)))
 }
 
 fn others_fingerprints(
@@ -1029,16 +1023,15 @@ fn others_fingerprints(
     if e.name == name {
       continue;
     }
-    map.insert(
-      e.name.clone(),
-      fingerprint(normalize_value(&e.value)),
-    );
+    map
+      .insert(e.name.clone(), fingerprint(normalize_value(&e.value)));
   }
   map
 }
 
 fn rest_fingerprint(stack: &Stack) -> String {
-  let mut v = serde_json::to_value(&stack.config).unwrap_or(json!({}));
+  let mut v =
+    serde_json::to_value(&stack.config).unwrap_or(json!({}));
   if let Some(obj) = v.as_object_mut() {
     obj.remove("environment");
   }
@@ -1061,7 +1054,9 @@ fn target_before(env: &str, name: &str) -> Value {
         "was_literal": reference_of(&one.value).is_none(),
       })
     }
-    [] => json!({ "fingerprint": Value::Null, "was_literal": Value::Null }),
+    [] => {
+      json!({ "fingerprint": Value::Null, "was_literal": Value::Null })
+    }
     many => json!({
       "fingerprint": Value::Null,
       "was_literal": Value::Null,
@@ -1148,9 +1143,12 @@ async fn edit_stack_env(
   let again = ctx.komodo.get_stack(&stack.id).await?;
   let again_env = again.config.environment.clone();
   let again_fp = fingerprint(&again_env);
-  if again_fp != base_fp
-    || if_base.is_some_and(|want| want != again_fp)
-  {
+  if if_base.is_some_and(|want| want != again_fp) {
+    bail!(
+      "refused: if_base does not match the current environment; nothing written"
+    );
+  }
+  if again_fp != base_fp {
     bail!(
       "conflict: environment changed since it was read; nothing written, re-run"
     );
@@ -1164,7 +1162,13 @@ async fn edit_stack_env(
     .context("UpdateStack failed")?;
   let update = find_env_update(ctx, &stack.id, t0).await?;
   match verify_env_write(
-    ctx, &stack, name, &base, &new_env, &others_before, &rest_before,
+    ctx,
+    &stack,
+    name,
+    &base,
+    &new_env,
+    &others_before,
+    &rest_before,
     &update,
   )
   .await
@@ -1188,10 +1192,11 @@ async fn edit_stack_env(
         "error: concurrent writers; manual check needed (update {update_id})"
       );
     }
-    Err(VerifyFail::Mismatch(msg)) => bail!("verification failed: {msg}"),
+    Err(VerifyFail::Mismatch(msg)) => {
+      bail!("verification failed: {msg}")
+    }
   }
 }
-
 
 fn chrono_now_ms() -> i64 {
   std::time::SystemTime::now()
@@ -1251,42 +1256,31 @@ async fn verify_env_write(
     .get_stack(&stack.id)
     .await
     .map_err(|e| VerifyFail::Mismatch(e.to_string()))?;
-  let written = environment_from_toml(&update.current_toml)
-    .unwrap_or_default();
-  // `new_env` is the splice of the buffer we read. When Core raced, it
-  // applied that splice to a different buffer, so the bytes that landed
-  // are the Update's current_toml, not `new_env`.
-  let landed = if written.trim_end_matches('\n')
-    == new_env.trim_end_matches('\n')
-  {
-    new_env
-  } else {
-    written.as_str()
+  // Lost update first: Core's prev_toml env must be the buffer we spliced.
+  // Compared as text extracted from the export, never as a raw secret log.
+  // Only a trailing newline may differ. A fingerprint match is not enough:
+  // a concurrent edit of this key, a comment or an unparsed line must
+  // still be reported.
+  let prev_env =
+    environment_from_toml(&update.prev_toml).unwrap_or_default();
+  let same = |a: &str, b: &str| {
+    a.trim_end_matches('\n') == b.trim_end_matches('\n')
   };
-  // A raced write lands the splice replayed onto another buffer, so the
-  // stored text is not the splice. The target key's fingerprint still has
-  // to match, and every other key is checked below.
-  let stored_target = others_one(&stored.config.environment, name);
-  let landed_target = others_one(landed, name);
-  let bytes_match = stored.config.environment.trim_end_matches('\n')
-    == landed.trim_end_matches('\n');
-  if !bytes_match && stored_target != landed_target {
+  if !same(&prev_env, base) {
+    return Err(VerifyFail::Lost {
+      update_id: update.id.clone(),
+    });
+  }
+  // After-write byte check: stored env equals the splice. Only a trailing
+  // newline may differ.
+  if !same(&stored.config.environment, new_env) {
     return Err(VerifyFail::Mismatch(
       "stored environment does not equal the splice".into(),
     ));
   }
-  let others_after = others_fingerprints(&stored.config.environment, name);
-  // A raced write keeps the other writer's keys. Those match `prev_toml`,
-  // not the buffer this call first read.
-  let prev_env = environment_from_toml(&update.prev_toml).unwrap_or_default();
-  let raced = prev_env.trim_end_matches('\n')
-    != base.trim_end_matches('\n');
-  let expected_others = if raced {
-    others_fingerprints(&prev_env, name)
-  } else {
-    others_before.clone()
-  };
-  if others_after != expected_others {
+  let others_after =
+    others_fingerprints(&stored.config.environment, name);
+  if others_after != *others_before {
     return Err(VerifyFail::Mismatch(
       "another key's fingerprint changed".into(),
     ));
@@ -1295,20 +1289,6 @@ async fn verify_env_write(
     return Err(VerifyFail::Mismatch(
       "rest-of-config fingerprint changed".into(),
     ));
-  }
-  let prev_env = environment_from_toml(&update.prev_toml).unwrap_or_default();
-  // Resource TOML drops `export` prefixes and re-quotes values, so the
-  // extracted env is not byte-identical to the buffer Core overwrote.
-  // The lost-update check is per-key fingerprints of every key except the
-  // one this call just wrote (names only, never the raw buffer).
-  let same_base = prev_env == base
-    || prev_env.trim_end_matches('\n') == base.trim_end_matches('\n')
-    || others_fingerprints(&prev_env, name)
-      == others_fingerprints(base, name);
-  if !same_base {
-    return Err(VerifyFail::Lost {
-      update_id: update.id.clone(),
-    });
   }
   let diff_stage = update
     .logs
@@ -1328,24 +1308,19 @@ async fn verify_env_write(
 fn diff_names(rendered: &str) -> Vec<String> {
   let mut names = Vec::new();
   for line in rendered.lines() {
-    let t = line.trim();
-    let Some(rest) = t
-      .strip_prefix("+ ")
-      .or_else(|| t.strip_prefix("- "))
-      .or_else(|| t.strip_prefix("~ "))
+    // Env lines are indented two spaces:
+    // `  + NAME = …`, `  - NAME (was …)`, `  ~ NAME: … -> …`.
+    // A field line (`~ config.branch: …`) is not indented. Do not trim
+    // before the indent check: `trim` would drop the two spaces.
+    let Some(rest) = line
+      .strip_prefix("  + ")
+      .or_else(|| line.strip_prefix("  - "))
+      .or_else(|| line.strip_prefix("  ~ "))
     else {
       continue;
     };
-    // `~ config.branch: …` is a non-env field. Skip it; env lines are
-    // `+ NAME = …`, `- NAME (was …)` or `~ NAME: … -> …`.
-    if rest.contains(':') && !rest.contains(" -> ") && !rest.contains('=') {
-      continue;
-    }
-    let token = rest
-      .split([' ', '=', ':'])
-      .next()
-      .unwrap_or("")
-      .trim();
+    let token =
+      rest.split([' ', '=', ':']).next().unwrap_or("").trim();
     if token.is_empty() || token.starts_with('(') {
       continue;
     }
