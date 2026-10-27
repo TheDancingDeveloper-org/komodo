@@ -100,15 +100,27 @@ jobs:
       # The upstream release this build is based on. It drives both the image
       # tag and which upstream UI image is pulled in, so the two can never
       # disagree.
+      #
+      # From v2.3.4, workspace.package.version is "0.0.0" and the published UI
+      # is ghcr.io/moghtech/komodo-ui:2 (see bin/core/multi-arch.Dockerfile),
+      # not komodo-ui:<cargo version>. The nearest ancestor tag is the release
+      # this branch was rebased onto.
       - name: Resolve the upstream version
         id: version
         run: |
           set -euo pipefail
-          version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          git fetch --tags --quiet origin || true
+          version="$(git describe --tags --abbrev=0 --exclude='*-dev-*' --match 'v[0-9]*')"
+          version="${version#v}"
           test -n "$version"
+          test "$version" != "0.0.0"
+          # ghcr.io/moghtech/komodo-ui is published as the major (":2"), not
+          # the full release (":2.3.4"). The image tag keeps the full release.
+          ui="${version%%.*}"
+          test -n "$ui"
           echo "komodo=$version" >> "$GITHUB_OUTPUT"
-          echo "Upstream base: $version"
+          echo "ui=$ui" >> "$GITHUB_OUTPUT"
+          echo "Upstream base: $version (UI tag $ui)"
 
       - name: Build and publish
         uses: docker/build-push-action@v7
@@ -120,7 +132,7 @@ jobs:
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
           provenance: false
           build-args: |
-            KOMODO_VERSION=${{ steps.version.outputs.komodo }}
+            KOMODO_VERSION=${{ steps.version.outputs.ui }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical
             ${{ env.IMAGE }}:${{ steps.version.outputs.komodo }}-infisical-${{ github.sha }}

@@ -13,7 +13,7 @@
 ## Node/yarn UI build, which matters because the Docker daemon this builds on
 ## is Node B's own and its root disk is the estate's tightest resource.
 
-ARG KOMODO_VERSION=2.2.0
+ARG KOMODO_VERSION=2
 ARG UI_IMAGE=ghcr.io/moghtech/komodo-ui:${KOMODO_VERSION}
 
 FROM rust:1.95.0-bookworm AS builder
