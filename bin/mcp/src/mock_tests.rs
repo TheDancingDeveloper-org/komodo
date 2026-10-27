@@ -83,7 +83,8 @@ struct Mock {
   update_list: Vec<UpdateListItem>,
   /// (endpoint, type, params, x-komodo-actor, x-komodo-reason)
   #[allow(clippy::type_complexity)]
-  requests: Vec<(String, String, Value, Option<String>, Option<String>)>,
+  requests:
+    Vec<(String, String, Value, Option<String>, Option<String>)>,
   /// Next UpdateStack writes the stored env as this string instead of the
   /// body that was sent. Consumed once. Used to fail verification.
   store_instead: Option<String>,
@@ -91,9 +92,8 @@ struct Mock {
   /// Consumed once.
   race_prev: Option<String>,
   /// Every UpdateStack reports this env as prev_toml. Not consumed, so a
-  /// repair write races too. After a write the next race appends `RACE=n`.
+  /// repair write races too.
   race_prev_always: Option<String>,
-  race_n: u64,
   /// GetStack calls so far, used to apply mutate_on_get on a later read.
   get_stack_calls: u64,
   /// After this many GetStack calls (1 = the next one), replace the stored
@@ -168,133 +168,6 @@ fn list_item(s: &Stack) -> StackListItem {
       latest_hash: Some("abc123".into()),
     },
   }
-}
-
-
-/// Replays the caller's edit onto the buffer Core overwrote.
-///
-/// A changed entry keeps the raced line's prefix (`export `, `- `) and
-/// takes the new value from the sent line. An added line is appended and
-/// a removed line is dropped. Matching is by key, so a TOML round trip
-/// that drops a prefix still replays onto the original line.
-fn apply_sent_over_prev(read: &str, sent: &str, prev: &str) -> String {
-  fn key_of(line: &str) -> Option<String> {
-    let t = line.trim().trim_start_matches("export ").trim_start_matches("- ");
-    let t = t.trim_start_matches('-').trim();
-    let (k, _) = t.split_once(['=', ':'])?;
-    let k = k.trim().trim_matches('"').trim_matches('\'');
-    if k.is_empty() { None } else { Some(k.to_string()) }
-  }
-  fn value_of(line: &str) -> String {
-    let t = line.trim().trim_start_matches("export ").trim_start_matches("- ");
-    let t = t.trim_start_matches('-').trim();
-    t.split_once(['=', ':']).map(|(_, v)| v.to_string()).unwrap_or_default()
-  }
-  let read_keys: Vec<Option<String>> = read.lines().map(key_of).collect();
-  let sent_lines: Vec<&str> = sent.lines().collect();
-  let sent_keys: Vec<Option<String>> = sent_lines.iter().copied().map(key_of).collect();
-  let mut prev_lines: Vec<String> = prev.lines().map(str::to_string).collect();
-  // Replace: same key, different value. Keep the raced line's prefix.
-  for (i, sk) in sent_keys.iter().enumerate() {
-    let Some(k) = sk else { continue };
-    let Some(ri) = read_keys.iter().position(|rk| rk.as_ref() == Some(k)) else {
-      continue;
-    };
-    if read.lines().nth(ri) == Some(sent_lines[i]) {
-      continue;
-    }
-    if let Some(pi) = prev_lines.iter().position(|l| key_of(l).as_ref() == Some(k)) {
-      let old = &prev_lines[pi];
-      let prefix_end = old.find(k).unwrap_or(0);
-      let mut rebuilt = old[..prefix_end].to_string();
-      rebuilt.push_str(k);
-      rebuilt.push('=');
-      let v = value_of(sent_lines[i]);
-      rebuilt.push_str(v.trim());
-      // Keep a trailing note that lived on the raced line.
-      if let Some(note) = old.find(" #") {
-        rebuilt.push_str(&old[note..]);
-      }
-      prev_lines[pi] = rebuilt;
-    }
-  }
-  // Add: a sent key the read did not have.
-  for (i, sk) in sent_keys.iter().enumerate() {
-    let Some(k) = sk else { continue };
-    if read_keys.iter().any(|rk| rk.as_ref() == Some(k)) {
-      continue;
-    }
-    if prev_lines.iter().any(|l| key_of(l).as_ref() == Some(k)) {
-      continue;
-    }
-    prev_lines.push(sent_lines[i].to_string());
-  }
-  // Remove: a read key the sent body dropped.
-  for rk in &read_keys {
-    let Some(k) = rk else { continue };
-    if sent_keys.iter().any(|sk| sk.as_ref() == Some(k)) {
-      continue;
-    }
-    if let Some(pi) = prev_lines.iter().position(|l| key_of(l).as_ref() == Some(k)) {
-      prev_lines.remove(pi);
-    }
-  }
-  let mut out = prev_lines.join("\n");
-  if (prev.ends_with('\n') || sent.ends_with('\n')) && !out.ends_with('\n') {
-    out.push('\n');
-  }
-  out
-}
-
-#[allow(dead_code)]
-fn apply_sent_over_prev_by_line(read: &str, sent: &str, prev: &str) -> String {
-  let read_lines: Vec<&str> = read.lines().collect();
-  let sent_lines: Vec<&str> = sent.lines().collect();
-  let mut prev_lines: Vec<String> =
-    prev.lines().map(str::to_string).collect();
-  let mut i = 0;
-  let mut j = 0;
-  while i < read_lines.len() && j < sent_lines.len() {
-    if read_lines[i] == sent_lines[j] {
-      i += 1;
-      j += 1;
-      continue;
-    }
-    let read_later = read_lines[i + 1..].contains(&sent_lines[j]);
-    let sent_later = sent_lines[j + 1..].contains(&read_lines[i]);
-    if sent_later && !read_later {
-      prev_lines.insert(i.min(prev_lines.len()), sent_lines[j].to_string());
-      j += 1;
-      continue;
-    }
-    if read_later && !sent_later {
-      if i < prev_lines.len() {
-        prev_lines.remove(i);
-      }
-      i += 1;
-      continue;
-    }
-    if i < prev_lines.len() {
-      prev_lines[i] = sent_lines[j].to_string();
-    }
-    i += 1;
-    j += 1;
-  }
-  while j < sent_lines.len() {
-    prev_lines.push(sent_lines[j].to_string());
-    j += 1;
-  }
-  while i < read_lines.len() {
-    if i < prev_lines.len() {
-      prev_lines.remove(i);
-    }
-    i += 1;
-  }
-  let mut out = prev_lines.join("\n");
-  if prev.ends_with('\n') || sent.ends_with('\n') {
-    out.push('\n');
-  }
-  out
 }
 
 fn update_item(u: &Update) -> UpdateListItem {
@@ -475,18 +348,22 @@ fn matches_query(u: &UpdateListItem, q: &bson::Document) -> bool {
   true
 }
 
-
-fn key_names(env: &str) -> std::collections::BTreeSet<String> {
-  names_diff::parse_env(env)
-    .entries
-    .into_iter()
-    .map(|e| e.name)
-    .collect()
-}
-
 fn env_resource_toml(name: &str, env: &str) -> String {
+  // Komodo's export is `[[stack]]` then `[stack.config]`. Encode the env
+  // with basic escapes so `environment_from_toml` returns the same bytes.
+  let mut escaped = String::new();
+  for c in env.chars() {
+    match c {
+      '\\' => escaped.push_str("\\\\"),
+      '"' => escaped.push_str("\\\""),
+      '\n' => escaped.push_str("\\n"),
+      '\r' => escaped.push_str("\\r"),
+      '\t' => escaped.push_str("\\t"),
+      other => escaped.push(other),
+    }
+  }
   format!(
-    "[[stack]]\nname = \"{name}\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\n{env}\"\"\"\n"
+    "[[stack]]\nname = \"{name}\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"{escaped}\"\n"
   )
 }
 
@@ -684,64 +561,27 @@ async fn handle(
         .ok_or_else(|| err("no stack"))?;
       let before = m.stacks[idx].config.environment.clone();
       let raced = if m.race_prev_always.is_some() {
-        m.race_n += 1;
-        if m.race_n > 1 {
-          let n = m.race_n;
-          if let Some(buf) = m.race_prev_always.as_mut() {
-            buf.push_str(&format!("RACE={n}\n"));
-          }
-        }
         m.race_prev_always.clone()
       } else {
-        m.race_prev.clone()
+        m.race_prev.take()
       };
-      // A repair sends the buffer it just read, which already contains the
-      // raced lines. That write is not a second lost update unless the
-      // raced buffer has moved again (a new line the repair never saw).
-      // A repair's sent body is the raced buffer with one key spliced, so
-      // it still contains every line of that buffer. A later race appends
-      // a line the repair never saw, and is not a repair.
-      // Key names only. A repair's body still names every key of the raced
-      // buffer (the spliced key included). A later race adds a key name
-      // the repair never sent.
-      let repair_of_race = raced.as_ref().is_some_and(|r| {
-        let sent_keys = key_names(&sent);
-        let rk = key_names(r);
-        rk.is_subset(&sent_keys)
-      });
-            if repair_of_race {
-        m.race_prev = None;
-      }
-      let prev = if repair_of_race {
-        before.clone()
-      } else {
-        raced.clone().unwrap_or_else(|| before.clone())
-      };
-      // Stored bytes are the caller's edit replayed onto the buffer Core
-      // overwrote, unless a test forces them.
-      let stored = m.store_instead.take().unwrap_or_else(|| {
-        if prev == before {
-          // The caller already spliced this buffer. Storing `sent` is
-          // what Core does: the body is the new field value.
-          sent.clone()
-        } else {
-          // A repair still names the raced keys, but Core stores the
-          // sent body as the new field, not a replay. Replaying here is
-          // what makes the Update's names-only diff show the one key
-          // this call changed against the buffer it overwrote.
-          apply_sent_over_prev(&before, &sent, &prev)
-        }
-      });
-            m.stacks[idx].config.environment = stored.clone();
+      // Core stores the sent body exactly. prev_toml is the buffer that
+      // was overwritten: the raced buffer when a test sets one, else the
+      // env that was stored before this write. Raw values stay in this
+      // in-process mock only; they are never written to a log.
+      let prev = raced.clone().unwrap_or_else(|| before.clone());
+      let stored = m.store_instead.take().unwrap_or(sent.clone());
+      m.stacks[idx].config.environment = stored.clone();
       m.update_seq += 1;
       let id = format!("cccccccccccccccccccc{:04x}", m.update_seq);
       let stack_id = m.stacks[idx].id.clone();
       let name = m.stacks[idx].name.clone();
       let prev_toml = env_resource_toml(&name, &prev);
       let current_toml = env_resource_toml(&name, &stored);
-      let diff = names_diff::diff_resource_toml(&prev_toml, &current_toml)
-        .map(|d| d.render())
-        .unwrap_or_else(|e| format!("diff failed: {e}"));
+      let diff =
+        names_diff::diff_resource_toml(&prev_toml, &current_toml)
+          .map(|d| d.render())
+          .unwrap_or_else(|e| format!("diff failed: {e}"));
 
       let reason_text = reason.clone().unwrap_or_default();
       let update = Update {
@@ -757,7 +597,9 @@ async fn handle(
         logs: vec![
           log(
             "Actor (asserted)",
-            &format!("actor: vogt-session:test\nreason: {reason_text}"),
+            &format!(
+              "actor: vogt-session:test\nreason: {reason_text}"
+            ),
             "",
             true,
           ),
@@ -1369,7 +1211,10 @@ async fn edit_env_one_key_others_byte_identical() {
   expect.push_str("BETA=");
   expect.push_str(REF);
   expect.push_str(&before[beta.end..]);
-  assert_eq!(after, expect, "splice was not byte-identical outside BETA");
+  assert_eq!(
+    after, expect,
+    "splice was not byte-identical outside BETA"
+  );
   assert!(after.contains("# keep this comment"));
   assert!(after.contains("this line is not a pair"));
   assert!(after.contains("line-a\nline-b"));
@@ -1452,7 +1297,11 @@ async fn edit_env_reason_is_required_and_stamped() {
   assert!(text.contains("missing string argument `reason`"));
   assert_eq!(update_stack_count(&state), 0);
 
-  let res = call_env(&server, json!({"reason": "because the design says so"})).await;
+  let res = call_env(
+    &server,
+    json!({"reason": "because the design says so"}),
+  )
+  .await;
   assert_eq!(res["isError"], false, "{res}");
   assert_eq!(
     reasons(&state),
@@ -1472,7 +1321,12 @@ async fn edit_env_dry_run_does_not_write() {
   assert_eq!(v["dry_run"], true);
   assert_eq!(v["changed"], true);
   assert_eq!(v["diff"]["changed"][0]["name"], "BETA");
-  assert!(v["base_fingerprint"].as_str().unwrap().starts_with("sha256:"));
+  assert!(
+    v["base_fingerprint"]
+      .as_str()
+      .unwrap()
+      .starts_with("sha256:")
+  );
   assert_eq!(dev_env(&state), before);
   assert_eq!(update_stack_count(&state), 0);
 }
@@ -1482,28 +1336,22 @@ async fn edit_env_dry_run_does_not_write() {
 async fn edit_env_key_errors_are_specific() {
   let (server, state) = start(policy("vogt-dev", "")).await;
   set_dev_env(&state, "A=1\nB=2\nA=3\n");
-  let missing = call_env(
-    &server,
-    json!({"name": "NOPE", "op": "replace"}),
-  )
-  .await;
+  let missing =
+    call_env(&server, json!({"name": "NOPE", "op": "replace"})).await;
   assert!(
     text_of_err(&missing).contains("key NOPE is missing"),
     "{missing}"
   );
-  let ambiguous = call_env(
-    &server,
-    json!({"name": "A", "op": "replace"}),
-  )
-  .await;
+  let ambiguous =
+    call_env(&server, json!({"name": "A", "op": "replace"})).await;
   let msg = text_of_err(&ambiguous);
   assert!(msg.contains("ambiguous: 2 entries named A"), "{msg}");
-  let exists = call_env(
-    &server,
-    json!({"name": "B", "op": "add"}),
-  )
-  .await;
-  assert!(text_of_err(&exists).contains("key B already exists"), "{exists}");
+  let exists =
+    call_env(&server, json!({"name": "B", "op": "add"})).await;
+  assert!(
+    text_of_err(&exists).contains("key B already exists"),
+    "{exists}"
+  );
   assert_eq!(update_stack_count(&state), 0);
 }
 
@@ -1555,7 +1403,8 @@ async fn edit_env_second_race_stops() {
   let (server, state) = start(policy("vogt-dev", "")).await;
   let before = rich_env();
   set_dev_env(&state, &before);
-  state.lock().unwrap().race_prev_always = Some(format!("{before}OTHER=1\n"));
+  state.lock().unwrap().race_prev_always =
+    Some(format!("{before}OTHER=1\n"));
   let res = call_env(&server, json!({})).await;
   assert_eq!(res["isError"], true, "{res}");
   let msg = text_of_err(&res);
@@ -1569,7 +1418,8 @@ async fn edit_env_second_race_stops() {
 async fn edit_env_verification_mismatch() {
   let (server, state) = start(policy("vogt-dev", "")).await;
   set_dev_env(&state, &rich_env());
-  state.lock().unwrap().store_instead = Some("NOT=the-splice\n".into());
+  state.lock().unwrap().store_instead =
+    Some("NOT=the-splice\n".into());
   let res = call_env(&server, json!({})).await;
   assert_eq!(res["isError"], true, "{res}");
   let msg = text_of_err(&res);
@@ -1585,7 +1435,8 @@ async fn edit_env_adds_sccache_reference_without_deploy() {
   set_dev_env(&state, "PLAIN=1\n");
   {
     let mut m = state.lock().unwrap();
-    let s = m.stacks.iter_mut().find(|s| s.name == "vogt-dev").unwrap();
+    let s =
+      m.stacks.iter_mut().find(|s| s.name == "vogt-dev").unwrap();
     s.config.pre_deploy = komodo_client::entities::SystemCommand {
       path: "sh".into(),
       command: "set -e\necho one\necho two".into(),
@@ -1608,7 +1459,10 @@ async fn edit_env_adds_sccache_reference_without_deploy() {
     .await;
   assert_eq!(res["isError"], false, "{res}");
   let stored = dev_env(&state);
-  assert!(stored.contains(&format!("SCCACHE_DIST_CLIENT_TOKEN={reference}")));
+  assert!(
+    stored
+      .contains(&format!("SCCACHE_DIST_CLIENT_TOKEN={reference}"))
+  );
   assert!(stored.starts_with("PLAIN=1\n"));
   assert!(types(&state).iter().all(|t| t != "DeployStack"));
   let m = state.lock().unwrap();
@@ -1660,4 +1514,73 @@ async fn edit_env_protected_stack_still_refused() {
   };
   assert_eq!(after, before);
   assert_eq!(update_stack_count(&state), 0);
+}
+
+/// Remove strips the entry, its prefix and its newline. Fake values only.
+#[tokio::test]
+async fn edit_env_remove_strips_prefix_and_newline() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "KEEP=1\nexport GONE=old\nTAIL=3\n");
+  let res =
+    call_env(&server, json!({"name": "GONE", "op": "remove"})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  assert_eq!(dev_env(&state), "KEEP=1\nTAIL=3\n");
+  assert_eq!(update_stack_count(&state), 1);
+}
+
+/// if_base matches the whole-env fingerprint, and a mismatch writes nothing.
+#[tokio::test]
+async fn edit_env_if_base_match_and_mismatch() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let env = rich_env();
+  set_dev_env(&state, &env);
+  let fp = names_diff::fingerprint(&env);
+  let bad = call_env(
+    &server,
+    json!({"if_base": "0000000000000000000000000000000000000000000000000000000000000000"}),
+  )
+  .await;
+  assert_eq!(bad["isError"], true, "{bad}");
+  assert!(text_of_err(&bad).contains("if_base"), "{bad}");
+  assert_eq!(update_stack_count(&state), 0);
+  assert_eq!(dev_env(&state), env);
+  let ok = call_env(&server, json!({"if_base": fp})).await;
+  assert_eq!(ok["isError"], false, "{ok}");
+  assert_eq!(update_stack_count(&state), 1);
+}
+
+/// Replacing a literal reports was_literal and does not keep the old value.
+#[tokio::test]
+async fn edit_env_replace_literal_reports_was_literal() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "PW=not-a-reference\nKEEP=1\n");
+  let res =
+    call_env(&server, json!({"name": "PW", "op": "replace"})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let body = text_of(&res);
+  assert_eq!(body["diff"]["changed"][0]["name"], "PW", "{body}");
+  assert!(
+    body["diff"]["changed"][0]["before"]["fingerprint"].is_string(),
+    "{body}"
+  );
+  let stored = dev_env(&state);
+  assert!(stored.contains(&format!("PW={REF}\n")), "{stored}");
+  assert!(!stored.contains("not-a-reference"), "{stored}");
+  assert!(stored.contains("KEEP=1\n"));
+}
+
+/// A `#` inside a quoted literal is part of the value, not a comment.
+/// Fake values only.
+#[tokio::test]
+async fn edit_env_replace_quoted_hash_does_not_keep_old_literal() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "PW=\"abc #s3cret more\"\nKEEP=1\n");
+  let res =
+    call_env(&server, json!({"name": "PW", "op": "replace"})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let stored = dev_env(&state);
+  assert!(!stored.contains("s3cret"), "{stored}");
+  assert!(stored.contains(&format!("PW={REF}\n")), "{stored}");
+  assert!(stored.contains("KEEP=1\n"), "{stored}");
+  assert_eq!(stored.lines().count(), 2, "{stored}");
 }
