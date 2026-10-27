@@ -1415,6 +1415,26 @@ async fn edit_env_verification_mismatch() {
   assert!(types(&state).iter().all(|t| t != "DeployStack"));
 }
 
+/// First add to an empty env: Core omits both empty environment assignments.
+#[tokio::test]
+async fn edit_env_adds_reference_to_empty_environment() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "");
+  let res = call_env(
+    &server,
+    json!({
+      "name": "FIRST",
+      "op": "add",
+      "reference": REF,
+      "reason": "first env key",
+    }),
+  )
+  .await;
+  assert_eq!(res["isError"], false, "{res}");
+  assert_eq!(dev_env(&state), format!("FIRST={REF}\n"));
+  assert_eq!(update_stack_count(&state), 1);
+}
+
 /// Env half of test 17: add the sccache reference; do not deploy.
 #[tokio::test]
 async fn edit_env_adds_sccache_reference_without_deploy() {
