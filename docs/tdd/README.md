@@ -40,6 +40,8 @@ Crucially, this does **not** make Komodo depend on Infisical being up. The last 
 Two more fork-only additions, both self-contained:
 
 - **`bin/mcp` (`komodo-mcp`)**: an MCP server built on the typed client. It replaces raw `curl` against the API, never returns `.config.environment` values, and gates writes and deploys per stack. Prod requires an exact opt-in.
+- **AWS builder left out of the image.** `bin/core`'s `aws` cargo feature is off by default, so `aws-sdk-ec2`, `aws-config` and `aws-credential-types` are not compiled. This estate does not use Komodo's AWS builder or EC2 server provisioning, and one `rustc` of `aws-sdk-ec2` reaches about 9.6 GiB, over the 10 GiB CI DinD limit (operator 2026-10-27). API types and the config schema are unchanged. An AWS builder or server operation returns `AWS support is not built into this Komodo image`. Rebuild with `--features aws` to restore it.
+
 - **`lib/names_diff` + `bin/core/src/tdd`**: Core now records two extra logs on Updates. One is a **names-only diff** of every resource config change, with env keys added, removed or changed and values shown as fingerprints. The other is the **asserted actor and reason** from `X-Komodo-Actor`/`X-Komodo-Reason`. Seeing what changed in a stack's env therefore no longer means reading `prev_toml`, which holds every secret (WI-865).
 
 ## Shape of the change

@@ -1,3 +1,4 @@
+#[cfg(feature = "aws")]
 pub mod aws;
 
 #[derive(Debug)]
@@ -8,5 +9,6 @@ pub enum BuildCleanupData {
   /// Cleanup Periphery connection
   Url,
   /// Clean up AWS instance
+  #[allow(dead_code)]
   Aws { instance_id: String, region: String },
 }

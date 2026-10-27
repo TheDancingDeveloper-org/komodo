@@ -13,7 +13,7 @@ use encoding::{
   WithChannel,
 };
 use komodo_client::entities::{
-  builder::{AwsBuilderConfig, UrlBuilderConfig},
+  builder::UrlBuilderConfig,
   optional_str,
   server::Server,
 };
@@ -176,10 +176,11 @@ impl<'a> PeripheryConnectionArgs<'a> {
     }
   }
 
+  #[cfg(feature = "aws")]
   pub fn from_aws_builder(
     id: &'a str,
     address: &'a str,
-    config: &'a AwsBuilderConfig,
+    config: &'a komodo_client::entities::builder::AwsBuilderConfig,
   ) -> Self {
     Self {
       id,

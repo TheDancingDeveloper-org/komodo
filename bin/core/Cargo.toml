@@ -45,15 +45,15 @@ toml_pretty.workspace = true
 slack.workspace = true
 svi.workspace = true
 # external
-aws-credential-types.workspace = true
+aws-credential-types = { workspace = true, optional = true }
 english-to-cron.workspace = true
 data-encoding.workspace = true
 serde_yaml_ng.workspace = true
 utoipa-scalar.workspace = true
 futures-util.workspace = true
-aws-sdk-ec2.workspace = true
+aws-sdk-ec2 = { workspace = true, optional = true }
 urlencoding.workspace = true
-aws-config.workspace = true
+aws-config = { workspace = true, optional = true }
 tokio-util.workspace = true
 axum-extra.workspace = true
 serde_json.workspace = true
@@ -86,3 +86,8 @@ hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 url.workspace = true
+[features]
+# FORK: off by default. This estate does not use the AWS builder or EC2
+# server provisioning, and compiling aws-sdk-ec2 exceeds the CI image limit.
+default = []
+aws = ["dep:aws-sdk-ec2", "dep:aws-config", "dep:aws-credential-types"]
