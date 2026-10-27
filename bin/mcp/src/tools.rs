@@ -17,8 +17,9 @@ use komodo_client::entities::{
 };
 use names_diff::{
   EnvChange, EnvDiff, EnvSpan, NamedValue, ValueRef, diff_env,
-  diff_file, diff_resource_toml, env_spans, environment_from_toml,
-  fingerprint, normalize_value, parse_env, reference_of,
+  diff_file, diff_resource_toml, env_spans, environment_assignment,
+  environment_from_toml, fingerprint, normalize_value, parse_env,
+  reference_of,
 };
 use serde_json::{Value, json};
 
@@ -1133,7 +1134,7 @@ async fn edit_stack_env(
       "diff": diff,
       "base_fingerprint": base_fp,
       "target_before": target_before(&base, name),
-      "unchanged": others_before,
+      "unchanged": others_before.len(),
       "latest_hash": stack.info.latest_hash,
       "note": "check stack_history before deploying",
     }));
@@ -1261,16 +1262,25 @@ async fn verify_env_write(
   // Only a trailing newline may differ. A fingerprint match is not enough:
   // a concurrent edit of this key, a comment or an unparsed line must
   // still be reported.
-  let prev_env =
-    environment_from_toml(&update.prev_toml).unwrap_or_default();
-  let same = |a: &str, b: &str| {
-    a.trim_end_matches('\n') == b.trim_end_matches('\n')
-  };
-  if !same(&prev_env, base) {
+  // Core writes prev_toml with toml_pretty 2.0.0, which emits a multiline
+  // string as `"""\n{val}"""` and does not escape backslashes. Extracting
+  // that does not return the bytes we sent. Render the spliced base the
+  // same way and compare the two extractions, so a `\` in a value is not
+  // reported as a race.
+  // Compare the assignment text, not extracted bytes. Core writes
+  // prev_toml with toml_pretty 2.0.0 as a multiline string and does not
+  // escape backslashes, so extraction is not a round trip. Rendering the
+  // spliced base with the same options produces the same assignment.
+  let prev_assign = environment_assignment(&update.prev_toml);
+  let base_assign = environment_assignment(&export_env_toml(base));
+  if prev_assign.is_none() || prev_assign != base_assign {
     return Err(VerifyFail::Lost {
       update_id: update.id.clone(),
     });
   }
+  let same = |a: &str, b: &str| {
+    a.trim_end_matches('\n') == b.trim_end_matches('\n')
+  };
   // After-write byte check: stored env equals the splice. Only a trailing
   // newline may differ.
   if !same(&stored.config.environment, new_env) {
@@ -1303,6 +1313,50 @@ async fn verify_env_write(
     )));
   }
   Ok(())
+}
+
+/// toml_pretty options copied from Core's `TOML_PRETTY_OPTIONS`. komodo_mcp
+/// does not link komodo_core, so the two must stay in step.
+fn toml_pretty_options() -> toml_pretty::Options<'static> {
+  toml_pretty::Options {
+    tab: "  ",
+    skip_empty_string: true,
+    skip_empty_object: true,
+    max_inline_array_length: 30,
+    inline_array: false,
+  }
+}
+
+/// Render an env the way Core's Update export does. toml_pretty 2.0.0 writes
+/// a multiline string as a basic multiline string with no escapes.
+fn export_env_toml(env: &str) -> String {
+  let value = serde_json::json!({ "environment": env });
+  toml_pretty::to_string(&value, toml_pretty_options())
+    .unwrap_or_default()
+}
+
+/// A resource export in Core's shape: `[[stack]]` then `[stack.config]`,
+/// with the env rendered by the same toml_pretty options Core uses.
+#[cfg(test)]
+pub(crate) fn export_env_resource_toml(
+  name: &str,
+  env: &str,
+) -> String {
+  let head = serde_json::json!({ "name": name });
+  let config = serde_json::json!({
+    "branch": "main",
+    "environment": env,
+  });
+  let opts = toml_pretty_options();
+  let mut out = String::from("[[stack]]\n");
+  out.push_str(
+    &toml_pretty::to_string(&head, opts).unwrap_or_default(),
+  );
+  out.push_str("\n[stack.config]\n");
+  out.push_str(
+    &toml_pretty::to_string(&config, opts).unwrap_or_default(),
+  );
+  out
 }
 
 fn diff_names(rendered: &str) -> Vec<String> {

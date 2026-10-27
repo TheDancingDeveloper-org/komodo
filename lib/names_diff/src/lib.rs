@@ -275,8 +275,7 @@ pub fn env_spans(input: &str) -> Vec<EnvSpan> {
   let mut offset = 0usize;
   let mut line_no = 1usize;
   while offset < bytes.len() {
-    let (entry_end, lines, span) =
-      span_at(input, offset, line_no);
+    let (entry_end, lines, span) = span_at(input, offset, line_no);
     if let Some(span) = span {
       out.push(span);
     }
@@ -676,9 +675,107 @@ fn diff_tables(
   }
 }
 
+/// The raw `environment = …` assignment inside a resource export, or `None`
+/// when the key is absent. Core's toml_pretty 2.0.0 writes a multiline env as
+/// a basic multiline string with no escaping, so a backslash or three quotes
+/// in the env makes the export invalid TOML. This is the source text Core
+/// stored. The lost-update check compares it, not a parsed value.
+pub fn environment_assignment(toml_str: &str) -> Option<String> {
+  let rest = toml_str.strip_prefix("environment").or_else(|| {
+    let key = toml_str.find("\nenvironment")?;
+    toml_str[key + 1..].strip_prefix("environment")
+  })?;
+  let after = rest.trim_start();
+  let after = after.strip_prefix('=')?.trim_start();
+  let (_decoded, n) = raw_toml_string(after)?;
+  Some(after[..n].to_string())
+}
+
+/// Decode one TOML string literal at the start of `s`. Returns the decoded
+/// text and how many source bytes the literal occupies, quotes included.
+/// Multiline forms are taken verbatim: that is how toml_pretty 2.0.0 writes
+/// them, with no escape processing.
+fn raw_toml_string(s: &str) -> Option<(String, usize)> {
+  if let Some(body) = s.strip_prefix("\"\"\"") {
+    let end = body.find("\"\"\"")?;
+    return Some((body[..end].to_string(), 3 + end + 3));
+  }
+  if let Some(body) = s.strip_prefix("'''") {
+    let end = body.find("'''")?;
+    return Some((body[..end].to_string(), 3 + end + 3));
+  }
+  let quote = s.chars().next()?;
+  if quote != '"' && quote != '\'' {
+    return None;
+  }
+  let mut out = String::new();
+  let mut chars = s[quote.len_utf8()..].char_indices();
+  while let Some((i, c)) = chars.next() {
+    if c == '\\' {
+      let (_, n) = chars.next()?;
+      out.push(match n {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        other => other,
+      });
+      continue;
+    }
+    if c == quote {
+      return Some((out, quote.len_utf8() + i + c.len_utf8()));
+    }
+    if c == '\n' {
+      return None;
+    }
+    out.push(c);
+  }
+  None
+}
+
 /// Extract the single resource table from a Komodo resource TOML export
 /// (`[[stack]] ... [stack.config] ...`).
+///
+/// When the export does not parse — Core's unescaped multiline env — the env
+/// assignment is lifted out and the remainder is parsed, so a names-only diff
+/// still names the changed keys. The lifted text is not returned.
 fn resource_table(toml_str: &str) -> Result<toml::Table, String> {
+  if let Ok(table) = resource_table_parsed(toml_str) {
+    return Ok(table);
+  }
+  let assign = environment_assignment(toml_str)
+    .ok_or_else(|| String::from("resource TOML did not parse"))?;
+  let key_at = toml_str
+    .find("\nenvironment")
+    .ok_or_else(|| String::from("resource TOML did not parse"))?
+    + 1;
+  let eq = toml_str[key_at..]
+    .find('=')
+    .ok_or_else(|| String::from("resource TOML did not parse"))?;
+  let value_at = key_at
+    + eq
+    + 1
+    + toml_str[key_at + eq + 1..]
+      .find(|c: char| !c.is_whitespace())
+      .unwrap_or(0);
+  let mut stripped = String::new();
+  stripped.push_str(&toml_str[..value_at]);
+  stripped.push_str("\"\"");
+  stripped.push_str(&toml_str[value_at + assign.len()..]);
+  let mut table = resource_table_parsed(&stripped)?;
+  if let Some(toml::Value::Table(config)) = table.get_mut("config")
+    && let Some((decoded, _)) = raw_toml_string(&assign)
+  {
+    config.insert("environment".into(), toml::Value::String(decoded));
+  }
+  Ok(table)
+}
+
+fn resource_table_parsed(
+  toml_str: &str,
+) -> Result<toml::Table, String> {
   if toml_str.trim().is_empty() {
     return Ok(toml::Table::new());
   }
@@ -902,6 +999,24 @@ NEW_ONE=[[infisical://apps/prod/NEW_ONE]]
     let err =
       diff_resource_toml(&format!("x = {S1}"), "").unwrap_err();
     assert_no_secret(&err);
+  }
+
+  #[test]
+  fn unescaped_multiline_env_still_names_keys() {
+    // toml_pretty 2.0.0 writes this with no escapes, so the export is not
+    // valid TOML. The names-only diff must still name the edited key and
+    // must not keep the value.
+    let prev = "[[stack]]\nname = \"s\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\nRE=a\\.b\nKEEP=1\n\"\"\"\n";
+    let curr = "[[stack]]\nname = \"s\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"\"\"\nRE=a\\.b\nKEEP=2\n\"\"\"\n";
+    let d = diff_resource_toml(prev, curr).unwrap();
+    let env = &d.env["config.environment"];
+    assert_eq!(env.changed[0].name, "KEEP");
+    let rendered = d.render();
+    assert!(!rendered.contains("a\\.b"), "{rendered}");
+    assert_eq!(
+      environment_assignment(prev),
+      Some("\"\"\"\nRE=a\\.b\nKEEP=1\n\"\"\"".into())
+    );
   }
 
   #[test]
