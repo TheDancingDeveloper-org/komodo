@@ -1705,6 +1705,26 @@ async fn edit_command_append_keeps_metadata_without_old_text() {
   );
 }
 
+#[tokio::test]
+async fn edit_command_append_to_empty_field_sets_path() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_command(&state, SystemCommand::default());
+  let response = call_command(
+    &server,
+    json!({"path": "/srv", "command": "echo appended"}),
+  )
+  .await;
+  assert_eq!(response["isError"], false, "{response}");
+  assert_eq!(
+    dev_command(&state),
+    SystemCommand {
+      path: "/srv".into(),
+      command: "echo appended\n".into(),
+      shell_mode: false,
+    }
+  );
+}
+
 /// Test 13: replace requires the current command fingerprint.
 #[tokio::test]
 async fn edit_command_replace_requires_matching_fingerprint() {
@@ -1762,6 +1782,18 @@ async fn edit_command_replace_requires_matching_fingerprint() {
   .await;
   assert_eq!(cleared["isError"], false, "{cleared}");
   assert_eq!(dev_command(&state).command, "");
+
+  let empty = call_command(
+    &server,
+    json!({
+      "op": "replace",
+      "command": "echo restored",
+      "if_fingerprint": "",
+    }),
+  )
+  .await;
+  assert_eq!(empty["isError"], false, "{empty}");
+  assert_eq!(dev_command(&state).command, "echo restored\n");
 }
 
 /// Test 14: known env values and token-shaped literals are refused silently.
@@ -1782,7 +1814,51 @@ async fn edit_command_refuses_literal_secrets_without_echoing() {
     );
     assert!(!text.contains(literal), "{text}");
   }
+  let path = call_command(
+    &server,
+    json!({"path": format!("/tmp/{SECRET_DB}")}),
+  )
+  .await;
+  assert_eq!(path["isError"], true, "{path}");
+  assert!(!path.to_string().contains(SECRET_DB), "{path}");
   assert_eq!(update_stack_count(&state), 0);
+}
+
+#[tokio::test]
+async fn edit_command_protected_stack_still_refused() {
+  let (server, state) = start(policy("vogt-*", "")).await;
+  let response = server
+    .call_tool(
+      "edit_stack_command",
+      &json!({
+        "stack": "vogt-prod",
+        "which": "pre_deploy",
+        "op": "append",
+        "command": "echo no",
+        "reason": "protected test",
+      }),
+    )
+    .await;
+  assert_eq!(response["isError"], true, "{response}");
+  assert_eq!(update_stack_count(&state), 0);
+}
+
+#[tokio::test]
+async fn edit_command_backslashes_are_not_a_false_race_or_leak() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  let old = "sed 's/\\./x/'\necho continue && \\\n+  echo done\n";
+  set_dev_command(
+    &state,
+    SystemCommand {
+      path: "sh".into(),
+      command: old.into(),
+      shell_mode: false,
+    },
+  );
+  let response = call_command(&server, json!({})).await;
+  assert_eq!(response["isError"], false, "{response}");
+  assert!(!response.to_string().contains("sed"), "{response}");
+  assert_eq!(update_stack_count(&state), 1);
 }
 
 #[tokio::test]
@@ -1790,12 +1866,13 @@ async fn edit_command_detects_race_and_verification_mismatch() {
   let (server, state) = start(policy("vogt-dev", "")).await;
   let current = SystemCommand {
     path: "sh".into(),
-    command: "echo old".into(),
+    command: "echo old && \\\n+  echo continued\nsed 's/\\./x/'\n"
+      .into(),
     shell_mode: false,
   };
   set_dev_command(&state, current.clone());
   state.lock().unwrap().command_race_prev = Some(SystemCommand {
-    command: "echo raced".into(),
+    command: "echo raced\n".into(),
     ..current.clone()
   });
   let raced = call_command(&server, json!({})).await;
@@ -1804,7 +1881,7 @@ async fn edit_command_detects_race_and_verification_mismatch() {
 
   set_dev_command(&state, current.clone());
   state.lock().unwrap().command_store_instead = Some(SystemCommand {
-    command: "echo wrong".into(),
+    command: "echo wrong\n".into(),
     ..current
   });
   let mismatch = call_command(&server, json!({})).await;
