@@ -349,22 +349,9 @@ fn matches_query(u: &UpdateListItem, q: &bson::Document) -> bool {
 }
 
 fn env_resource_toml(name: &str, env: &str) -> String {
-  // Komodo's export is `[[stack]]` then `[stack.config]`. Encode the env
-  // with basic escapes so `environment_from_toml` returns the same bytes.
-  let mut escaped = String::new();
-  for c in env.chars() {
-    match c {
-      '\\' => escaped.push_str("\\\\"),
-      '"' => escaped.push_str("\\\""),
-      '\n' => escaped.push_str("\\n"),
-      '\r' => escaped.push_str("\\r"),
-      '\t' => escaped.push_str("\\t"),
-      other => escaped.push(other),
-    }
-  }
-  format!(
-    "[[stack]]\nname = \"{name}\"\n\n[stack.config]\nbranch = \"main\"\nenvironment = \"{escaped}\"\n"
-  )
+  // Same renderer as Core's Update export (toml_pretty 2.0.0, Core's
+  // options). A multiline env is `"""\n{bytes}"""` with no escaping.
+  crate::tools::export_env_resource_toml(name, env)
 }
 
 async fn handle(
@@ -1583,4 +1570,20 @@ async fn edit_env_replace_quoted_hash_does_not_keep_old_literal() {
   assert!(stored.contains(&format!("PW={REF}\n")), "{stored}");
   assert!(stored.contains("KEEP=1\n"), "{stored}");
   assert_eq!(stored.lines().count(), 2, "{stored}");
+}
+
+/// A backslash in a value must not look like a lost update. Core's export
+/// does not escape `\\`, so the check compares both sides after the same
+/// render. Fake values only. A line ending in `\\` is included.
+#[tokio::test]
+async fn edit_env_backslash_is_not_a_false_race() {
+  let (server, state) = start(policy("vogt-dev", "")).await;
+  set_dev_env(&state, "RE=a\\.b\nTRAIL=end\\\nKEEP=1\n");
+  let res =
+    call_env(&server, json!({"name": "KEEP", "op": "replace"})).await;
+  assert_eq!(res["isError"], false, "{res}");
+  let stored = dev_env(&state);
+  assert!(stored.contains("RE=a\\.b\n"), "{stored}");
+  assert!(stored.contains("TRAIL=end\\\n"), "{stored}");
+  assert!(stored.contains(&format!("KEEP={REF}\n")), "{stored}");
 }

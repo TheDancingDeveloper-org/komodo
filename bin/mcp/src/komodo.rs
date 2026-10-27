@@ -19,8 +19,8 @@ use komodo_client::{
   entities::{
     docker::container::Container,
     stack::{
-      Stack, StackActionState, StackListItem, StackService,
-      _PartialStackConfig,
+      _PartialStackConfig, Stack, StackActionState, StackListItem,
+      StackService,
     },
     update::{Log, Update, UpdateStatus},
   },
