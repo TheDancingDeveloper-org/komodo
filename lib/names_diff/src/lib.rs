@@ -255,6 +255,149 @@ pub fn parse_env(input: &str) -> ParsedEnv {
   out
 }
 
+/// Byte range of one parsed environment entry, using the same rules as
+/// [`parse_env`]. `start..end` covers from the key through the end of the
+/// entry's last line, and not the line terminator that follows it. `line`
+/// is 1-based.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSpan {
+  pub name: String,
+  pub value: String,
+  pub start: usize,
+  pub end: usize,
+  pub line: usize,
+}
+
+/// Locate every entry [`parse_env`] would keep, as a byte range in `input`.
+pub fn env_spans(input: &str) -> Vec<EnvSpan> {
+  let mut out = Vec::new();
+  let bytes = input.as_bytes();
+  let mut offset = 0usize;
+  let mut line_no = 1usize;
+  while offset < bytes.len() {
+    let (entry_end, lines, span) =
+      span_at(input, offset, line_no);
+    if let Some(span) = span {
+      out.push(span);
+    }
+    let mut cursor = offset;
+    let mut seen = 0usize;
+    while seen < lines && cursor < bytes.len() {
+      match bytes[cursor..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| cursor + i)
+      {
+        Some(n) => {
+          cursor = n + 1;
+          seen += 1;
+          line_no += 1;
+        }
+        None => {
+          cursor = bytes.len();
+          break;
+        }
+      }
+    }
+    if cursor <= offset {
+      break;
+    }
+    offset = cursor;
+    let _ = entry_end;
+  }
+  out
+}
+
+/// One entry starting at `offset`: how many source lines it occupies and,
+/// when it parses, its span.
+fn span_at(
+  input: &str,
+  offset: usize,
+  line_no: usize,
+) -> (usize, usize, Option<EnvSpan>) {
+  let bytes = input.as_bytes();
+  let nl = bytes[offset..]
+    .iter()
+    .position(|b| *b == b'\n')
+    .map(|i| offset + i);
+  let line_end = nl.unwrap_or(bytes.len());
+  let raw = &input[offset..line_end];
+  let trimmed = raw.trim();
+  if trimmed.is_empty()
+    || trimmed.starts_with('#')
+    || trimmed.starts_with("//")
+  {
+    return (line_end, 1, None);
+  }
+  let body = trimmed.trim_start_matches('-').trim();
+  let body = body.strip_prefix("export ").unwrap_or(body).trim();
+  let Some(idx) = body.find(['=', ':']) else {
+    return (line_end, 1, None);
+  };
+  let mut key = body[..idx].trim();
+  let mut value = body[idx + 1..].trim().to_string();
+  if (key.starts_with('"') || key.starts_with('\''))
+    && !(key.ends_with('"') || key.ends_with('\''))
+  {
+    key = key[1..].trim();
+    if value.ends_with('"') || value.ends_with('\'') {
+      value.pop();
+      value = value.trim().to_string();
+    }
+  }
+  let mut end = line_end;
+  let mut lines = 1usize;
+  if let Some(q) =
+    value.chars().next().filter(|c| *c == '"' || *c == '\'')
+    && (value.len() == 1 || !value.ends_with(q))
+  {
+    let mut cursor = line_end;
+    loop {
+      if cursor >= bytes.len() || bytes[cursor] != b'\n' {
+        end = bytes.len();
+        break;
+      }
+      let next_start = cursor + 1;
+      let next_nl = bytes[next_start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| next_start + i);
+      let next_end = next_nl.unwrap_or(bytes.len());
+      let next = &input[next_start..next_end];
+      value.push('\n');
+      value.push_str(next);
+      end = next_end;
+      lines += 1;
+      cursor = next_end;
+      if next.trim_end().ends_with(q) || next_nl.is_none() {
+        break;
+      }
+    }
+    value = value.trim_end().to_string();
+  } else if let Some((v, _)) = value.split_once(" #") {
+    value = v.trim().to_string();
+  }
+  if !valid_key(key) {
+    return (end, lines, None);
+  }
+  let lead = raw.len() - raw.trim_start().len();
+  let trimmed_start = offset + lead;
+  let rel = input[trimmed_start..end]
+    .find(key)
+    .expect("parsed key sits inside its span");
+  (
+    end,
+    lines,
+    Some(EnvSpan {
+      name: key.to_string(),
+      value,
+      start: trimmed_start + rel,
+      end,
+      line: line_no,
+    }),
+  )
+}
+
 /// What is known about one env value without showing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueRef {
@@ -768,6 +911,39 @@ NEW_ONE=[[infisical://apps/prod/NEW_ONE]]
     );
     let env = environment_from_toml(&t).unwrap();
     assert_eq!(parse_env(&env).names(), ["K"]);
+  }
+
+  #[test]
+  fn env_spans_match_parse_env() {
+    let fixtures = [
+      "A=1\nB=2\n",
+      "# c\nexport FOO=bar\n- BAZ=qux # note\n",
+      "Q=\"line1\nline2\"\nAFTER=1\n",
+      "not a pair\n:bad=1\nOK=x\n",
+      "A=\"x\"\nB='y'\n",
+      "EMPTY=\n",
+      "WEIRD:colon\n",
+      "  spaced = value  \n",
+      "\"KEY=value\"\n",
+      "",
+      "A=1",
+      "MULTI=\"a\nb\nc\"\nZ=9\n",
+    ];
+    for (i, fixture) in fixtures.iter().enumerate() {
+      let parsed = parse_env(fixture);
+      let spans = env_spans(fixture);
+      assert_eq!(
+        spans.len(),
+        parsed.entries.len(),
+        "fixture {i} count"
+      );
+      for (span, entry) in spans.iter().zip(&parsed.entries) {
+        assert_eq!(span.name, entry.name, "fixture {i}");
+        assert_eq!(span.value, entry.value, "fixture {i}");
+        assert!(span.start <= span.end);
+        assert!(span.end <= fixture.len());
+      }
+    }
   }
 
   #[test]

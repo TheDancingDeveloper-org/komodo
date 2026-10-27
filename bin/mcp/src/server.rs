@@ -15,7 +15,7 @@ use crate::{
   config::Policy,
   komodo::Komodo,
   redact::Scrubber,
-  tools::{self, Ctx},
+  tools::{self, Ctx, EnvLocks},
 };
 
 pub const SUPPORTED_PROTOCOLS: &[&str] =
@@ -25,6 +25,7 @@ pub struct Server {
   pub komodo: Komodo,
   pub policy: Policy,
   pub poll: Duration,
+  pub env_locks: EnvLocks,
 }
 
 impl Server {
@@ -37,6 +38,7 @@ impl Server {
       policy: &self.policy,
       scrubber: &scrubber,
       poll: self.poll,
+      env_locks: &self.env_locks,
     };
     let (mut body, is_error) =
       match tools::call(&ctx, name, args).await {
@@ -120,7 +122,7 @@ pub fn instructions(policy: &Policy) -> String {
   format!(
     "Komodo stacks via typed tools; use these instead of curl against the Komodo API. \
      Secrets are redacted server-side: env is names + fingerprints only. {mode} \
-     Typical deploy: stack_lookup -> read_stack_file -> write_stack_file -> deploy_stack -> container_health. \
+     Typical deploy: stack_lookup -> read_stack_file -> write_stack_file -> deploy_stack -> container_health.      Change one env key with edit_stack_env (an [[infisical://alias/env/KEY]] reference only; never a literal). \
      To answer 'what changed and who': stack_history(since_last_successful_deploy=true) or env_diff(against={{last_successful_deploy:true}})."
   )
 }
