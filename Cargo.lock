@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "komodo_mcp"
-version = "2.2.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3227,7 +3227,7 @@ dependencies = [
  "mogh_resolver",
  "names_diff",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",
@@ -3824,7 +3824,7 @@ dependencies = [
 
 [[package]]
 name = "names_diff"
-version = "2.2.0"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
