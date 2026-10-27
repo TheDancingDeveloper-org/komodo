@@ -6,10 +6,10 @@ use database::mungos::{
 };
 use komodo_client::{
   api::read::{
-    FindUser, FindUserResponse, GetUsername, GetUsernameResponse,
-    ListApiKeys, ListApiKeysForServiceUser,
-    ListApiKeysForServiceUserResponse, ListApiKeysResponse,
-    ListUsers, ListUsersResponse,
+    FindUser, FindUserResponse, GetUser, GetUserResponse,
+    GetUsername, GetUsernameResponse, ListApiKeys,
+    ListApiKeysForServiceUser, ListApiKeysForServiceUserResponse,
+    ListApiKeysResponse, ListUsers, ListUsersResponse,
   },
   entities::user::{UserConfig, admin_service_user},
 };
@@ -19,6 +19,17 @@ use crate::{helpers::query::get_user, state::db_client};
 
 use super::ReadArgs;
 
+impl Resolve<ReadArgs> for GetUser {
+  async fn resolve(
+    self,
+    ReadArgs { user }: &ReadArgs,
+  ) -> mogh_error::Result<GetUserResponse> {
+    let mut user = user.clone();
+    user.sanitize();
+    Ok(user)
+  }
+}
+
 impl Resolve<ReadArgs> for GetUsername {
   async fn resolve(
     self,
@@ -27,6 +38,7 @@ impl Resolve<ReadArgs> for GetUsername {
     if let Some(user) = admin_service_user(&self.user_id) {
       return Ok(GetUsernameResponse {
         username: user.username,
+        service_user: true,
         avatar: None,
       });
     }
@@ -44,6 +56,7 @@ impl Resolve<ReadArgs> for GetUsername {
 
     Ok(GetUsernameResponse {
       username: user.username,
+      service_user: matches!(user.config, UserConfig::Service { .. }),
       avatar,
     })
   }

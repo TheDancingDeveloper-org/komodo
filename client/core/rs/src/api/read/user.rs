@@ -10,6 +10,20 @@ use super::KomodoReadRequest;
 
 //
 
+/// Gets the authenticated user.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoReadRequest)]
+#[response(GetUserResponse)]
+#[error(mogh_error::Error)]
+pub struct GetUser {}
+
+#[typeshare]
+pub type GetUserResponse = User;
+
+//
+
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
@@ -193,6 +207,8 @@ pub struct GetUsername {
 pub struct GetUsernameResponse {
   /// The username of the user.
   pub username: String,
+  /// Whether the user is a service user.
+  pub service_user: bool,
   /// An optional icon for the user.
   pub avatar: Option<String>,
 }

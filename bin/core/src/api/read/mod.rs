@@ -84,6 +84,7 @@ fn list_limit(limit: Option<u64>) -> u64 {
 #[serde(tag = "type", content = "params")]
 enum ReadRequest {
   GetVersion(GetVersion),
+  GetUser(GetUser),
   GetCoreInfo(GetCoreInfo),
   ListSecrets(ListSecrets),
   ListGitProvidersFromConfig(ListGitProvidersFromConfig),

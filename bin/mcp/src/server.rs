@@ -17,6 +17,7 @@ use crate::{
   redact::Scrubber,
   tools::{self, Ctx, EnvLocks},
 };
+use komodo_client::entities::user::User;
 
 pub const SUPPORTED_PROTOCOLS: &[&str] =
   &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -26,6 +27,8 @@ pub struct Server {
   pub policy: Policy,
   pub poll: Duration,
   pub env_locks: EnvLocks,
+  pub api_user: User,
+  pub unlock_max_ttl: Duration,
 }
 
 impl Server {
@@ -39,6 +42,8 @@ impl Server {
       scrubber: &scrubber,
       poll: self.poll,
       env_locks: &self.env_locks,
+      api_user: &self.api_user,
+      unlock_max_ttl: self.unlock_max_ttl,
     };
     let (mut body, is_error) =
       match tools::call(&ctx, name, args).await {
@@ -115,8 +120,8 @@ pub fn instructions(policy: &Policy) -> String {
     )
   } else {
     format!(
-      "Mutations allowed for stacks matching {:?}; protected patterns {:?} need an exact opt-in (opted in: {:?}).",
-      policy.write, policy.protected, policy.allow_protected
+      "Mutations allowed for stacks matching {:?}; protected patterns {:?} require a current KOMODO_MCP_UNLOCK__<STACK> Variable with the needed scope.",
+      policy.write, policy.protected
     )
   };
   format!(

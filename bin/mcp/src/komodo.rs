@@ -10,7 +10,8 @@ use komodo_client::{
   api::{
     execute::DeployStack,
     read::{
-      GetStack, GetStackActionState, GetStackLog, GetUpdate,
+      GetStack, GetStackActionState, GetStackLog, GetUpdate, GetUser,
+      GetUsername, GetUsernameResponse, GetVariable,
       InspectStackContainer, ListStackServices, ListStacks,
       ListUpdates, ListUpdatesResponse,
     },
@@ -23,6 +24,8 @@ use komodo_client::{
       StackService,
     },
     update::{Log, Update, UpdateStatus},
+    user::User,
+    variable::Variable,
   },
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -81,6 +84,29 @@ impl Komodo {
 
   pub async fn version(&self) -> anyhow::Result<String> {
     self.client.core_version().await
+  }
+
+  pub async fn get_user(&self) -> anyhow::Result<User> {
+    self.client.read(GetUser {}).await
+  }
+
+  pub async fn get_username(
+    &self,
+    user_id: &str,
+  ) -> anyhow::Result<GetUsernameResponse> {
+    self
+      .client
+      .read(GetUsername {
+        user_id: user_id.into(),
+      })
+      .await
+  }
+
+  pub async fn get_variable(
+    &self,
+    name: &str,
+  ) -> anyhow::Result<Variable> {
+    self.client.read(GetVariable { name: name.into() }).await
   }
 
   pub async fn list_stacks(
